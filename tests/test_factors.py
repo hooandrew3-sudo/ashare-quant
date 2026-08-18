@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from quant.config import Config
@@ -35,6 +36,50 @@ def test_factor_computation_shapes():
     assert factor_long["value"].notna().mean() > 0.5
 
 
+def test_neutralize_batched_equals_old():
+    """批量中性化与旧实现（逐因子逐日 lstsq）在稠密输入下数值等价。"""
+    from quant.factors.compute import _build_X_by_date, _neutralize_batched
+
+    rng = np.random.default_rng(0)
+    dates = pd.bdate_range("2023-01-02", periods=30)
+    syms = [f"S{i:02d}" for i in range(50)]
+    df1 = pd.DataFrame(rng.normal(size=(30, 50)), index=dates, columns=syms)
+    df2 = pd.DataFrame(rng.normal(size=(30, 50)), index=dates, columns=syms)
+    industry = pd.Series({s: f"IND{i % 10}" for i, s in enumerate(syms)})
+    dummies = pd.get_dummies(industry, prefix="ind").astype(float)
+    size_panel = pd.DataFrame(rng.normal(size=(30, 50)), index=dates, columns=syms)
+    X_by_date = _build_X_by_date(dates, syms, dummies, size_panel)
+    new = _neutralize_batched([df1, df2], X_by_date)
+
+    def old(df):
+        out = df.copy()
+        for dt, row in out.iterrows():
+            X = pd.concat(
+                [dummies, size_panel.loc[dt].to_frame("size")], axis=1
+            ).fillna(0.0).to_numpy()
+            y = row.values.astype(float)
+            mask = ~np.isnan(y)
+            beta, *_ = np.linalg.lstsq(X[mask], y[mask], rcond=None)
+            out.loc[dt] = y - X @ beta
+        return out
+
+    np.testing.assert_allclose(new[0].values, old(df1).values, atol=1e-10)
+    np.testing.assert_allclose(new[1].values, old(df2).values, atol=1e-10)
+
+
+def test_factor_coverage_report():
+    cfg = _cfg()
+    bundle = generate_synthetic(
+        n_stocks=cfg.data.demo.n_stocks,
+        years=cfg.data.demo.years,
+        seed=cfg.run.seed,
+    )
+    _long, cov = compute_all_factors(bundle, cfg, report_coverage=True)
+    assert {"date", "factor", "coverage_ratio", "non_null", "n_symbols"}.issubset(cov.columns)
+    assert (cov["coverage_ratio"] >= 0.0).all() and (cov["coverage_ratio"] <= 1.0).all()
+    assert cov["factor"].nunique() >= 10
+
+
 def test_consensus_snapshot_does_not_crash():
     """consensus 快照表（as_of_date 列）不得让因子管线崩溃（回归：2026-08-18）。"""
     cfg = _cfg()
@@ -60,6 +105,29 @@ def test_consensus_snapshot_does_not_crash():
     assert not rev.empty
     # 单日快照不足 30 个交易日位移 → 修正值应为 0（中性占位）
     assert (rev["value"] == 0.0).all()
+
+
+def test_consensus_pip_shift():
+    """一致预期快照（盘后采集）最早下一交易日可用：shift(1) 语义。"""
+    from quant.factors.definitions import Panels, _f_consensus_revision
+
+    idx = pd.bdate_range("2026-01-02", periods=60)
+    close = pd.DataFrame(10.0, index=idx, columns=["A.SH", "B.SH"])
+    cons = pd.DataFrame(np.nan, index=idx, columns=["A.SH"])
+    cons.loc[idx[0], "A.SH"] = 1.0
+    cons.loc[idx[30], "A.SH"] = 1.2
+    p = Panels(
+        close=close, volume=close, amount=close, turnover=close,
+        pe=close, pb=close, roe=close, gross_margin=close,
+        div_yield=close, consensus=cons,
+    )
+    out = _f_consensus_revision(p)
+    # 采集日（idx[30]）当天：新快照不可用，且 30 日前快照尚未生效 → NaN
+    assert pd.isna(out.loc[idx[30], "A.SH"])
+    # 下一交易日：新快照生效 → +20%
+    assert abs(out.loc[idx[31], "A.SH"] - 0.2) < 1e-9
+    # 历史不足 30 个交易日：保持 NaN（供覆盖度哨兵观测）
+    assert pd.isna(out.loc[idx[10], "A.SH"])
 
 
 def test_ic_report_structure():

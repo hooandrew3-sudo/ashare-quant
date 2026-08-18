@@ -63,6 +63,10 @@ class FactorConfig:
     composite_corr_max: float = 0.6
     composite_require_decay: bool = True
     composite_weight: str = "icir"  # icir | t | equal
+    # 因子健康度哨兵：连续 N 日原始覆盖度低于阈值时告警（防因子静默退化）
+    coverage_watch: list[str] = field(default_factory=lambda: ["consensus_revision"])
+    coverage_min_ratio: float = 0.3
+    coverage_min_days: int = 5
 
 
 @dataclass
@@ -78,6 +82,14 @@ class ModelConfig:
     test_months: int = 6
     n_splits: int = 5
     selection_mode: str = "model"  # model(ML概率) | composite(复合因子直接排序) | hybrid(两者融合)
+    # 模型上线门禁（默认口径遵循 docs/FINAL_VERDICT.md 重标定结论：
+    # ML 层 AUC/单因子 IC 无增量不设门槛，信号质量以复合因子 t 值为主门槛）
+    gate_enabled: bool = True
+    gate_min_auc: float = 0.0
+    gate_min_rank_ic: float = 0.0
+    gate_min_composite_t: float = 5.0
+    gate_min_folds: int = 5
+    gate_block_on_fail: bool = True
     params: dict[str, Any] = field(
         default_factory=lambda: {
             "n_estimators": 300,
@@ -206,14 +218,25 @@ class Config:
         运行期覆盖（如每日任务 --source baostock --universe csi800）不应
         触发"配置不一致"拒绝出信号；策略参数变化（因子集/模型/组合约束）
         才必须重新训练。
+
+        门禁阈值（gate_*）与因子哨兵阈值（coverage_*）属于运维策略而非模型
+        输入：调整它们不应使历史模型失效（指纹变更会强制重训），故从指纹中
+        排除。后续新增运维字段请沿用 gate_ / coverage_ 前缀。
         """
         import hashlib
 
+        def _section(dc):
+            return {
+                k: v
+                for k, v in to_dict(dc).items()
+                if not k.startswith("gate_") and not k.startswith("coverage_")
+            }
+
         blob = yaml.safe_dump(
             {
-                "factors": to_dict(self.factors),
-                "model": to_dict(self.model),
-                "portfolio": to_dict(self.portfolio),
+                "factors": _section(self.factors),
+                "model": _section(self.model),
+                "portfolio": _section(self.portfolio),
             },
             sort_keys=True,
         ).encode("utf-8")

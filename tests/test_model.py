@@ -90,3 +90,22 @@ def test_ensemble_scores():
     assert "score" in merged.columns
     assert merged["score"].between(0, 1).all()
     assert len(merged) == 20
+
+
+def test_model_gate():
+    from quant.model.gate import evaluate_model_gate
+
+    cfg = Config()
+    cfg.model.gate_min_composite_t = 5.0
+    meta = {
+        "fold_summary": {"n_folds": 10, "auc_mean": 0.5, "rank_ic_excess_mean": 0.01},
+        "composite_t": 8.1,
+    }
+    assert evaluate_model_gate(cfg, meta)["passed"]
+    # 复合因子 t 低于门槛 → 不通过
+    assert not evaluate_model_gate(cfg, dict(meta, composite_t=3.0))["passed"]
+    # 旧模型缺 composite_t → 不通过（要求重训）
+    assert not evaluate_model_gate(cfg, dict(meta, composite_t=None))["passed"]
+    # 禁用复合因子时跳过该检查
+    cfg.factors.composite = False
+    assert evaluate_model_gate(cfg, dict(meta, composite_t=None))["passed"]

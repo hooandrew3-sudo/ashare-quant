@@ -54,6 +54,32 @@ def test_buy_applies_cost_and_slippage() -> None:
     assert pos.available == 0  # T+1 当日不可卖
 
 
+def test_paper_last_price_date_bound() -> None:
+    """_last_price 必须受 trade_date 约束，数据含未来行情时不得前视。"""
+    prices = pd.concat(
+        [_one_day_prices("2026-02-05", close=10.0), _one_day_prices("2026-02-06", close=20.0)],
+        ignore_index=True,
+    )
+    broker = PaperBroker(prices)
+    broker.trade_date = "2026-02-05"
+    assert broker.last_price("A.SH") == 10.0
+    broker.trade_date = "2026-02-06"
+    assert broker.last_price("A.SH") == 20.0
+
+
+def test_buy_shrinks_on_insufficient_cash() -> None:
+    """现金不足时按可负担数量缩量成交，而非整单拒绝（与回测引擎一致）。"""
+    prices = _one_day_prices()
+    broker = PaperBroker(prices, initial_cash=30_000.0, cost=CostModel())
+    broker.trade_date = "2026-02-05"
+    order = Order(id="t_buy_big", symbol="A.SH", side="buy", shares=5000, price=10.0)
+    broker.place_order(order)
+    assert order.status == OrderStatus.FILLED
+    pos = broker.get_positions()["A.SH"]
+    assert 0 < pos.shares < 5000  # 部分成交
+    assert broker.get_cash() >= 0.0
+
+
 def test_t1_settle_unlocks_and_sell_fills() -> None:
     prices = _one_day_prices()
     broker = PaperBroker(prices, initial_cash=100_000.0, cost=CostModel())
@@ -72,6 +98,128 @@ def test_t1_settle_unlocks_and_sell_fills() -> None:
     assert sell.status == OrderStatus.FILLED
     assert broker.get_cash() > cash_before
     assert "A.SH" not in broker.get_positions()
+
+
+def test_paper_backtest_reconciliation() -> None:
+    """同一目标组合下 PaperBroker 与 BacktestEngine 最终净值应接近（<2%）。"""
+    from quant.backtest.cost import CostModel
+    from quant.backtest.engine import BacktestEngine
+
+    dates = pd.bdate_range("2023-01-02", periods=60)
+    rows = []
+    for sym, drift in [("A.SH", 0.10), ("B.SH", 0.20), ("C.SH", -0.05)]:
+        close = 10.0 * (1 + drift * np.linspace(0, 1, len(dates)))
+        rows.append(
+            pd.DataFrame(
+                {
+                    "date": dates,
+                    "symbol": sym,
+                    "open": close * 0.999,
+                    "high": close * 1.01,
+                    "low": close * 0.99,
+                    "close": close,
+                    "volume": 1e6,
+                    "amount": 1e6 * close * 100,
+                    "turnover": 1.0,
+                    "is_limit_up": False,
+                    "is_limit_down": False,
+                    "is_limit_up_open": False,
+                    "is_limit_down_open": False,
+                    "is_suspended": False,
+                    "is_st": False,
+                }
+            )
+        )
+    prices = pd.concat(rows, ignore_index=True)
+    bench = pd.DataFrame(
+        {"date": dates, "close": np.linspace(1000, 1100, len(dates))}
+    )
+
+    cfg = Config()
+    bt_cfg, pf_cfg = cfg.backtest, cfg.portfolio
+    bt_cfg.start, bt_cfg.end = str(dates[0].date()), str(dates[-1].date())
+    pf_cfg.top_n = 3
+    rebal = [dates[19], dates[39]]
+    tw = pd.concat(
+        [
+            pd.DataFrame(
+                {"date": rebal[0], "symbol": ["A.SH", "B.SH"], "weight": [0.5, 0.5]}
+            ),
+            pd.DataFrame(
+                {
+                    "date": rebal[1],
+                    "symbol": ["A.SH", "B.SH", "C.SH"],
+                    "weight": [1 / 3, 1 / 3, 1 / 3],
+                }
+            ),
+        ],
+        ignore_index=True,
+    )
+
+    engine = BacktestEngine(prices, bench, bt_cfg, pf_cfg)
+    res = engine.run(tw, start=bt_cfg.start, end=bt_cfg.end)
+    bt_nav = float(res.equity["portfolio_value"].iloc[-1])
+
+    cost = CostModel(
+        commission_bp=bt_cfg.commission_bp,
+        stamp_bp=bt_cfg.stamp_bp,
+        transfer_bp=bt_cfg.transfer_bp,
+        slippage_bp=bt_cfg.slippage_bp,
+        min_commission=bt_cfg.min_commission,
+        lot_size=bt_cfg.lot_size,
+    )
+    broker = PaperBroker(prices, initial_cash=bt_cfg.initial_cash, cost=cost)
+
+    def _rebalance(date, weights):
+        broker.trade_date = str(date.date())
+        broker.settle(broker.trade_date)
+        pv = broker.portfolio_value()
+        held = {s: p for s, p in broker.get_positions().items() if p.shares > 0}
+        for sym, pos in held.items():
+            if sym not in weights and pos.available > 0:
+                broker.place_order(
+                    Order(
+                        id=f"{date.date()}_{sym}_out", symbol=sym, side="sell",
+                        shares=pos.available, price=broker.last_price(sym),
+                    )
+                )
+        for sym, w in weights.items():
+            px = broker.last_price(sym)
+            if px != px or px <= 0:
+                continue
+            cur_val = held[sym].shares * px if sym in held else 0.0
+            target_val = pv * w
+            diff = target_val - cur_val
+            if diff > px * cost.lot_size:
+                shares = int(
+                    (diff - cost.buy_fee(diff)) // px // cost.lot_size * cost.lot_size
+                )
+                if shares > 0:
+                    broker.place_order(
+                        Order(
+                            id=f"{date.date()}_{sym}_buy", symbol=sym, side="buy",
+                            shares=shares, price=px,
+                        )
+                    )
+            elif diff < -px * cost.lot_size:
+                avail = held[sym].available if sym in held else 0
+                shares = min(int(-diff // px // cost.lot_size * cost.lot_size), avail)
+                if shares > 0:
+                    broker.place_order(
+                        Order(
+                            id=f"{date.date()}_{sym}_sell", symbol=sym, side="sell",
+                            shares=shares, price=px,
+                        )
+                    )
+
+    _rebalance(rebal[0], {"A.SH": 0.5, "B.SH": 0.5})
+    _rebalance(rebal[1], {"A.SH": 1 / 3, "B.SH": 1 / 3, "C.SH": 1 / 3})
+    # 期末估值：把 paper 交易日推进到回测末日（真实每日任务会逐日推进）
+    broker.trade_date = str(dates[-1].date())
+    broker.settle(broker.trade_date)
+    paper_nav = broker.portfolio_value()
+    diff_pct = abs(paper_nav - bt_nav) / bt_cfg.initial_cash
+    assert diff_pct < 0.02, f"paper/backtest NAV diff {diff_pct:.2%} >= 2%"
 
 
 def _mini_storage(root, n_days: int, closes: dict[str, float]) -> Storage:

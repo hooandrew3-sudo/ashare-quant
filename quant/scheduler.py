@@ -56,6 +56,12 @@ def run_daily(cfg: Config, output_root: str = "artifacts") -> dict:
             return {"skipped": True, "latest": str(latest.date())}
 
         signals = live_signals(cfg, output_root)
+        # 因子覆盖度哨兵：数据源失效导致因子静默退化为 0 时告警
+        from quant.monitor.coverage import check_factor_coverage
+
+        cov_alerts = check_factor_coverage(Path(output_root) / "signals", cfg)
+        for alert in cov_alerts:
+            notifier.send("因子覆盖度告警", alert)
         top = signals.head(min(cfg.portfolio.top_n, len(signals)))
         lines = "\n".join(
             f"{r['symbol']}: {r['score']:.4f}" for _, r in top.iterrows()

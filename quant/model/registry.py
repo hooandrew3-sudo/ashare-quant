@@ -51,6 +51,8 @@ class ModelRegistry:
             "config_fingerprint": cfg.fingerprint(),
             "strategy_fingerprint": cfg.strategy_fingerprint(),
             "data_fingerprint": data_fingerprint,
+            "composite_t": result.get("composite_t"),
+            "composite_rank_ic": result.get("composite_rank_ic"),
             "feature_cols": result.get("feature_cols", []),
             "horizons": sorted(models.keys()) if models else [cfg.model.horizon],
             "model_params": {

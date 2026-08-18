@@ -116,3 +116,51 @@
 ### 生产模型基线（real.yaml 指纹 797ba5f8960f）
 - 60 folds（4 周期 × 3 种子 × 5 折）；OOS AUC 0.5007、Rank IC 0.0136；
   部署校准器（isotonic）已随模型持久化，后续每日任务走严格策略指纹门禁。
+
+---
+
+## 第二轮整改（采纳外部审核意见，按顺序执行）
+
+### 1. PaperBroker 日期上界（P1 前视）
+- [paper.py](../quant/execution/paper.py) `_last_price` 按 `trade_date` 截断，
+  数据碰脏（含未来行情）不再前视；新增回归测试。
+
+### 2. consensus_revision PIP 掩码（P1 前视）
+- [definitions.py](../quant/factors/definitions.py) 快照对齐交易日历后
+  `shift(1)`：盘后采集的一致预期最早下一交易日参与决策；历史不足 30 日
+  或无覆盖保持 NaN（走标准 winsorize→zscore→0 填充），原始覆盖度可被
+  哨兵观测。新增 PIP 单测（采集日不可用、次日生效、历史不足为 NaN）。
+
+### 3. 模型上线门禁（Model Gate）
+- 新增 [gate.py](../quant/model/gate.py)：`n_folds ≥ 5` + 复合因子
+  `t ≥ 5.0`（FINAL_VERDICT 重标定口径）为硬门槛，AUC/单因子 IC 为信息项
+  （默认 min=0）；阈值经 `model.gate_*` 可配置，`gate_block_on_fail` 控制
+  告警/硬失败。
+- [registry.py](../quant/model/registry.py) 持久化 `composite_t /
+  composite_rank_ic`；[pipeline.py](../quant/pipeline.py) live 出信号前评估
+  并写 `signals/gate_<date>.json`，不达标默认硬失败。
+- 策略指纹排除 `gate_* / coverage_*` 运维字段：调整门禁/哨兵阈值不会强制
+  重训历史模型（新增指纹单测）。
+
+### 4. 中性化向量化（性能）
+- [compute.py](../quant/factors/compute.py) 回归设计矩阵（行业哑变量 + 规模）
+  预计算一次、跨因子复用；多因子 RHS 单次 lstsq 批量求解（调用次数从
+  n_factors × n_dates 降为 n_dates）。实测：1052 只 × 2129 日，中性化
+  **55s → 6.5s**；因子+标签+IC 全链路约 91s。修复了 `neutralize_size=False`
+  时哑变量行数与横截面不一致的潜在崩溃。
+- 数值等价性单测：批量路径与旧逐日循环结果 allclose。
+
+### 5. paper/backtest 对账
+- 修复 PaperBroker 现金不足整单拒绝：改为按可负担数量缩量成交（与回测引擎
+  语义一致）——此前二次调仓时 C 股买入被整体拒绝，导致 1/3 仓位现金拖累。
+- 新增对账测试：同一目标组合下 paper 与 backtest 期末净值偏差 **0.068%**
+  （容差 2%）。
+
+### 6. 因子覆盖度哨兵
+- 新增 [coverage.py](../quant/monitor/coverage.py)：扫描
+  `signals/factor_coverage_*.json`，`coverage_watch` 因子连续 N 日原始覆盖度
+  低于阈值触发告警（默认 consensus_revision、30%、5 日）。
+- `compute_all_factors(report_coverage=True)` 输出原始值覆盖度；live 写
+  `factor_coverage_<date>.json`，scheduler 每日检查并通知。
+- 实测：当前 consensus_revision 覆盖度 0.0（快照历史不足 30 日），哨兵将
+  如实告警直到数据累积，防止因子静默退化为 0。

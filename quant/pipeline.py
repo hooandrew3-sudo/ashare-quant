@@ -195,7 +195,8 @@ def run_research(
     log.info(rep_p.summary())
 
     # 2. 因子
-    factor_long = compute_all_factors(bundle, cfg)
+    factor_long, cov = compute_all_factors(bundle, cfg, report_coverage=True)
+    cov.to_parquet(art / "factor_coverage.parquet", index=False)
 
     # 3. 标签 + IC 报告（完整报告用于研究归档）
     label_long = build_label(bundle.prices, bundle.benchmark, cfg)
@@ -370,6 +371,9 @@ def run_research(
         "feature_cols": feature_cols,
         "calibrator": _final_cal,
     }
+    _comp_meta = (ic_report.get("factors") or {}).get("composite", {}) if isinstance(ic_report, dict) else {}
+    result["composite_t"] = _comp_meta.get("t_stat")
+    result["composite_rank_ic"] = _comp_meta.get("rank_ic_mean")
     registry = ModelRegistry(Path(output_root))
     data_fingerprint = pd.util.hash_pandas_object(bundle.prices).sum()
     run_id_model = registry.save_run(cfg, str(data_fingerprint), result, run_id=run_id)
@@ -557,12 +561,31 @@ def live_signals(cfg: Config, output_root: str | Path = "artifacts") -> pd.DataF
             "建议用当前配置重训一次以启用门禁",
             runs[-1],
         )
+    # 模型上线门禁：OOS 质量阈值（默认复合因子 t≥5），不达标按配置告警或硬失败
+    from quant.model.gate import evaluate_model_gate
+
+    gate = evaluate_model_gate(cfg, meta)
+    gate["model"] = runs[-1]
+    latest_date_gate = pd.Timestamp(bundle.prices["date"].max())
+    sig_dir = ensure_dir(Path(output_root) / "signals")
+    (sig_dir / f"gate_{latest_date_gate.date()}.json").write_text(
+        json.dumps(gate, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+    if cfg.model.gate_enabled and not gate["passed"]:
+        detail = ", ".join(gate["failed_checks"])
+        if cfg.model.gate_block_on_fail:
+            raise RuntimeError(
+                f"模型上线门禁未通过（{detail}）：模型 {runs[-1]} 不满足当前配置阈值，"
+                "禁止出信号。请按当前配置重训，或调整 model.gate_* 阈值。"
+            )
+        log.warning("模型上线门禁未通过（%s），当前为告警模式，继续出信号", detail)
     models = latest.get("models") or {}
     if not models and latest.get("model") is None:
         raise RuntimeError(f"模型 {runs[-1]} 缺少 model.joblib")
     feature_cols = meta.get("feature_cols", [])
 
-    factor_long = compute_all_factors(bundle, cfg)
+    factor_long, cov = compute_all_factors(bundle, cfg, report_coverage=True)
     # 特征包含 composite 时需同步构建复合因子（与 run_research 准入逻辑一致）
     if any(c.replace("f_", "") == "composite" for c in feature_cols):
         from quant.factors.analysis import factor_ic_report
@@ -612,5 +635,23 @@ def live_signals(cfg: Config, output_root: str | Path = "artifacts") -> pd.DataF
     out_dir = ensure_dir(Path(output_root) / "signals")
     signals.to_csv(out_dir / f"signals_{latest_date.date()}.csv", index=False)
     signals.to_json(out_dir / f"signals_{latest_date.date()}.json", orient="records", indent=2)
+    # 因子覆盖度快照（原始值口径），供每日哨兵检测数据源失效
+    cov_recent = cov[pd.to_datetime(cov["date"]) >= pd.to_datetime(cov["date"]).max() - pd.Timedelta(days=35)]
+    cov_summary = {}
+    for f, g in cov_recent.groupby("factor"):
+        latest_row = g.loc[g["date"].idxmax()]
+        cov_summary[f] = {
+            "coverage_ratio_latest": round(float(latest_row["coverage_ratio"]), 4),
+            "coverage_ratio_mean_20d": round(float(g["coverage_ratio"].tail(20).mean()), 4),
+            "n_symbols": int(latest_row["n_symbols"]),
+        }
+    (out_dir / f"factor_coverage_{latest_date.date()}.json").write_text(
+        json.dumps(
+            {"date": str(latest_date.date()), "factors": cov_summary},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     log.info("今日信号已生成: %d 只, 日期 %s", len(signals), latest_date.date())
     return signals

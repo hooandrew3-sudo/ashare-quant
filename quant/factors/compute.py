@@ -180,56 +180,144 @@ def _winsorize_zscore(df: pd.DataFrame, winsor: float) -> pd.DataFrame:
 
 
 def _neutralize(df: pd.DataFrame, industry_map: pd.Series, size_panel: pd.DataFrame | None) -> pd.DataFrame:
-    """行业 + 规模中性化：对 [行业哑变量, log(成交额)] 回归取残差。"""
-    symbols = df.columns
-    dummies = None
+    """行业 + 规模中性化（单因子兼容入口，语义与批量路径一致）。"""
+    out = df.copy()
     if industry_map is not None and not industry_map.empty:
-        inds = industry_map.reindex(symbols).dropna()
+        inds = industry_map.reindex(df.columns).dropna()
         if len(inds) >= 5 and inds.nunique() >= 2:
             dummies = pd.get_dummies(inds, prefix="ind").astype(float)
+            # 哑变量对齐到完整股票池：无行业映射的股票为全 0 行，
+            # 保证 X 行数与横截面一致（旧实现依赖 size 面板隐式补齐）
+            dummies = dummies.reindex(index=df.columns).fillna(0.0)
+        else:
+            dummies = None
+    else:
+        dummies = None
     if dummies is None and (size_panel is None or size_panel.empty):
-        return df
-    out = df.copy()
-    for dt, row in out.iterrows():
-        y = row.values.astype(float)
+        return out
+    X_by_date = _build_X_by_date(out.index, out.columns, dummies, size_panel)
+    return _neutralize_batched([out], X_by_date)[0]
+
+
+def _build_X_by_date(
+    dates, symbols, dummies: pd.DataFrame | None, size_panel: pd.DataFrame | None
+) -> dict[pd.Timestamp, np.ndarray]:
+    """预计算每日回归设计矩阵 [行业哑变量, log(成交额)]，跨因子复用。"""
+    out: dict[pd.Timestamp, np.ndarray] = {}
+    for dt in dates:
         parts: list[pd.DataFrame] = []
         if dummies is not None:
             parts.append(dummies)
         if size_panel is not None and dt in size_panel.index:
-            size_row = size_panel.loc[dt].reindex(symbols).to_frame("size")
-            parts.append(size_row)
+            parts.append(size_panel.loc[dt].reindex(symbols).to_frame("size"))
         if not parts:
             continue
-        X = pd.concat(parts, axis=1).fillna(0.0).to_numpy()
-        mask = ~np.isnan(y)
-        if mask.sum() < 10:
-            continue
-        beta, *_ = np.linalg.lstsq(X[mask], y[mask], rcond=None)
-        out.loc[dt] = y - X @ beta
+        out[dt] = pd.concat(parts, axis=1).fillna(0.0).to_numpy()
     return out
+
+
+def _neutralize_batched(
+    frames: list[pd.DataFrame], X_by_date: dict[pd.Timestamp, np.ndarray]
+) -> list[pd.DataFrame]:
+    """批量中性化：单次 lstsq 同时求解全部因子的残差（多目标 RHS）。
+
+    输入须为去极值/z-score 后的稠密面板（winsorize 已 fillna(0)），
+    与旧实现（逐因子逐日单目标 lstsq）在稠密输入下数值等价，
+    但 lstsq 调用次数从 n_factors × n_dates 降为 n_dates。
+    """
+    ref = frames[0]
+    idx, cols = ref.index, ref.columns
+    for f in frames[1:]:
+        if not (f.index.equals(idx) and f.columns.equals(cols)):
+            raise ValueError("批量中性化要求各因子面板索引/列完全一致")
+    Y = np.stack([f.values for f in frames], axis=-1)  # dates × symbols × n_factors
+    out = np.zeros_like(Y, dtype=float)
+    for i, dt in enumerate(idx):
+        X = X_by_date.get(dt)
+        y = Y[i]
+        if X is None:
+            out[i] = y
+            continue
+        finite = np.isfinite(y).all(axis=1)
+        if finite.sum() < 10:
+            out[i] = y
+            continue
+        beta, *_ = np.linalg.lstsq(X[finite], y[finite], rcond=None)
+        resid = y - X @ beta
+        resid[~finite] = np.nan  # 防御：原 NaN 保持 NaN
+        out[i] = resid
+    return [pd.DataFrame(out[:, :, j], index=idx, columns=cols) for j in range(len(frames))]
 
 
 def compute_all_factors(
     bundle: DataBundle,
     cfg: Config,
     factors: list[str] | None = None,
+    report_coverage: bool = False,
 ) -> pd.DataFrame:
-    """计算全部因子并做预处理，返回长表：date, symbol, factor, value。"""
+    """计算全部因子并做预处理，返回长表：date, symbol, factor, value。
+
+    report_coverage=True 时返回 (factor_long, coverage_long)：
+    coverage_long = date, factor, coverage_ratio, non_null, n_symbols（基于原始
+    因子值，供因子健康度哨兵观测数据质量）。
+    """
     log = setup_logging(cfg.run.verbose)
     panels = build_panels(bundle, cfg)
     names = factors or list(FACTOR_SPECS.keys())
+    raw_by_name = {
+        name: FACTOR_SPECS[name]["compute"](panels) for name in names
+    }
+    clean_by_name = {
+        name: _winsorize_zscore(raw, cfg.factors.winsor)
+        for name, raw in raw_by_name.items()
+    }
+    if cfg.factors.neutralize_industry or cfg.factors.neutralize_size:
+        X_by_date = _build_factor_regressors(panels, cfg)
+        if X_by_date:
+            cleaned = _neutralize_batched(
+                [clean_by_name[n] for n in names], X_by_date
+            )
+            clean_by_name = dict(zip(names, cleaned))
     frames: list[pd.DataFrame] = []
     for name in names:
-        spec = FACTOR_SPECS[name]
-        raw = spec["compute"](panels)
-        clean = _winsorize_zscore(raw, cfg.factors.winsor)
-        if cfg.factors.neutralize_industry or cfg.factors.neutralize_size:
-            size_panel = None
-            if cfg.factors.neutralize_size and not panels.amount.empty:
-                size_panel = np.log(panels.amount.rolling(60, min_periods=20).mean() + 1.0)
-            clean = _neutralize(clean, panels.industry, size_panel)
-        long = clean.stack().rename("value").reset_index()
+        long = clean_by_name[name].stack().rename("value").reset_index()
         long["factor"] = name
         frames.append(long[["date", "symbol", "factor", "value"]])
         log.info("factor %s computed: %d non-null", name, int(long["value"].notna().sum()))
-    return pd.concat(frames, ignore_index=True)
+    out = pd.concat(frames, ignore_index=True)
+    if report_coverage:
+        cov_rows: list[dict] = []
+        for name in names:
+            raw = raw_by_name[name]
+            for dt, row in raw.iterrows():
+                cov_rows.append(
+                    {
+                        "date": dt,
+                        "factor": name,
+                        "non_null": int(row.notna().sum()),
+                        "n_symbols": int(len(row)),
+                    }
+                )
+        cov = pd.DataFrame(cov_rows)
+        cov["coverage_ratio"] = cov["non_null"] / cov["n_symbols"].clip(lower=1)
+        return out, cov[["date", "factor", "coverage_ratio", "non_null", "n_symbols"]]
+    return out
+
+
+def _build_factor_regressors(
+    panels: Panels, cfg: Config
+) -> dict[pd.Timestamp, np.ndarray]:
+    """预计算每日中性化回归设计矩阵（行业哑变量 + log(成交额)），跨因子复用。"""
+    symbols = panels.close.columns
+    dummies = None
+    if panels.industry is not None and not panels.industry.empty:
+        inds = panels.industry.reindex(symbols).dropna()
+        if len(inds) >= 5 and inds.nunique() >= 2:
+            dummies = pd.get_dummies(inds, prefix="ind").astype(float)
+            dummies = dummies.reindex(index=symbols).fillna(0.0)
+    size_panel = None
+    if cfg.factors.neutralize_size and not panels.amount.empty:
+        size_panel = np.log(panels.amount.rolling(60, min_periods=20).mean() + 1.0)
+    if dummies is None and (size_panel is None or size_panel.empty):
+        return {}
+    return _build_X_by_date(panels.close.index, symbols, dummies, size_panel)

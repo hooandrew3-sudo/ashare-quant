@@ -61,6 +61,13 @@ def test_strategy_fingerprint_ignores_data_overrides():
     b.data.sync.universe = "csi800"
     b.backtest.start = "2020-01-01"
     assert a.strategy_fingerprint() == b.strategy_fingerprint()
+    # 门禁阈值属于运维策略，不改变策略指纹（否则调整门禁会强制重训历史模型）
+    b.model.gate_min_composite_t = 9.0
+    b.model.gate_block_on_fail = False
+    assert a.strategy_fingerprint() == b.strategy_fingerprint()
+    b.factors.coverage_min_ratio = 0.5
+    b.factors.coverage_watch = ["quality"]
+    assert a.strategy_fingerprint() == b.strategy_fingerprint()
     b.model.n_splits = 7
     assert a.strategy_fingerprint() != b.strategy_fingerprint()
 

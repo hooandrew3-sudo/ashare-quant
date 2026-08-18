@@ -29,6 +29,10 @@ factors:
   composite_corr_max: 0.6      # 成分相关性上限（去冗余）
   composite_require_decay: true # 成分需衰减稳定（5/20 日同号）
   composite_weight: icir        # 复合权重：icir | t | equal
+  # 因子健康度哨兵：连续 N 日原始覆盖度低于阈值时告警（防数据源失效导致因子静默退化）
+  coverage_watch: ["consensus_revision"]
+  coverage_min_ratio: 0.3
+  coverage_min_days: 5
 
 model:
   name: auto                   # lightgbm | gbt | auto
@@ -41,6 +45,13 @@ model:
   train_years: 3
   test_months: 6
   n_splits: 5
+  # 模型上线门禁（默认口径：ML 层无增量不设 AUC/IC 门槛，复合因子 t≥5 为硬门槛）
+  gate_enabled: true
+  gate_min_auc: 0.0
+  gate_min_rank_ic: 0.0
+  gate_min_composite_t: 5.0
+  gate_min_folds: 5
+  gate_block_on_fail: true
   params:
     n_estimators: 300
     learning_rate: 0.05

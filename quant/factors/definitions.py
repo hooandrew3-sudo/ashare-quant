@@ -143,16 +143,19 @@ def _f_consensus_revision(p: Panels) -> pd.DataFrame:
 
     数据来源：consensus 快照序列（每日采集累积）。
     revision = 当前一致预期EPS / 30个交易日前一致预期EPS - 1，正值=上修（看多信号）。
-    数据不足（<2 个快照或缺失）时返回 0（中性，不引入错误信号）。
+    PIP 约束：快照 as_of_date 为采集日（盘后），对齐到交易日历后 shift(1)，
+    最早只能在下一交易日参与决策，杜绝盘后信息进入当日收盘决策。
+    历史不足 30 个交易日或无覆盖的股票保持 NaN：走标准 winsorize→zscore→
+    截面中位数（0）填充路径，同时让原始覆盖度可被因子健康度哨兵观测。
     """
     if p.consensus is None or p.consensus.empty:
         return pd.DataFrame(0.0, index=p.close.index, columns=p.close.columns)
-    # 快照可能非日频：先对齐到交易日历（asof 前向取最近快照），
-    # 再按 30 个交易日位移，避免“行位移”在周频/不规则快照下语义漂移。
-    aligned = p.consensus.reindex(index=p.close.index, method="ffill")
+    # 快照可能非日频：先对齐到交易日历（asof 前向取最近快照），再 shift(1)
+    # 实现"采集日盘后信息最早次日可用"，最后按 30 个交易日位移。
+    aligned = p.consensus.reindex(index=p.close.index, method="ffill").shift(1)
     rev = aligned / aligned.shift(30) - 1.0
-    rev = rev.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    return rev.reindex(index=p.close.index, columns=p.close.columns).fillna(0.0)
+    rev = rev.replace([np.inf, -np.inf], np.nan)
+    return rev.reindex(index=p.close.index, columns=p.close.columns)
 
 
 def _f_size_proxy(p: Panels) -> pd.DataFrame:

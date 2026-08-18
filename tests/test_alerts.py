@@ -67,3 +67,41 @@ def test_feishu_token_cached() -> None:
     token_calls = [c for c in calls if "tenant_access_token" in c.full_url]
     assert len(token_calls) == 1  # token 复用，不重复获取
     assert len(calls) == 3
+
+
+def test_factor_coverage_sentinel(tmp_path):
+    """连续 N 日覆盖度低于阈值触发告警；最新一日恢复则不再告警。"""
+    from quant.config import Config
+    from quant.monitor.coverage import check_factor_coverage
+
+    cfg = Config()
+    cfg.factors.coverage_watch = ["consensus_revision"]
+    cfg.factors.coverage_min_ratio = 0.3
+    cfg.factors.coverage_min_days = 3
+    for i, ratio in enumerate([0.1, 0.2, 0.1]):
+        (tmp_path / f"factor_coverage_2026-08-{10 + i}.json").write_text(
+            json.dumps(
+                {
+                    "date": f"2026-08-{10 + i}",
+                    "factors": {
+                        "consensus_revision": {"coverage_ratio_mean_20d": ratio}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+    alerts = check_factor_coverage(tmp_path, cfg)
+    assert len(alerts) == 1 and "consensus_revision" in alerts[0]
+    # 最新一日覆盖度恢复正常 → 连续计数清零
+    (tmp_path / "factor_coverage_2026-08-13.json").write_text(
+        json.dumps(
+            {
+                "date": "2026-08-13",
+                "factors": {
+                    "consensus_revision": {"coverage_ratio_mean_20d": 0.8}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert check_factor_coverage(tmp_path, cfg) == []

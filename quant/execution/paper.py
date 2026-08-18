@@ -47,6 +47,9 @@ class PaperBroker:
         if symbol not in self._close.columns:
             return float("nan")
         series = self._close[symbol].dropna()
+        if self.trade_date is not None:
+            # 日期上界：数据碰脏（含未来行情）时不得前视
+            series = series[series.index <= pd.Timestamp(self.trade_date)]
         return float(series.iloc[-1]) if len(series) else float("nan")
 
     def last_price(self, symbol: str) -> float:
@@ -78,10 +81,22 @@ class PaperBroker:
             amount = fill_px * order.shares
             fee = self._cost.buy_fee(amount)
             if amount + fee > self._cash:
-                order.status = OrderStatus.REJECTED
-                order.reason = "insufficient_cash"
-                self._orders.append(order)
-                return order.id
+                # 现金不足：按可负担数量缩量（与回测引擎 _execute 语义一致），
+                # 避免"整单拒绝"导致调仓目标落空、组合偏离
+                shrink = order.shares
+                while shrink > 0:
+                    f = self._cost.buy_fee(fill_px * shrink)
+                    if fill_px * shrink + f <= self._cash + 1e-6:
+                        break
+                    shrink -= self._cost.lot_size
+                if shrink <= 0:
+                    order.status = OrderStatus.REJECTED
+                    order.reason = "insufficient_cash"
+                    self._orders.append(order)
+                    return order.id
+                order.shares = shrink
+                amount = fill_px * shrink
+                fee = self._cost.buy_fee(amount)
             self._cash -= amount + fee
             pos = self._positions.get(order.symbol)
             if pos is None:
