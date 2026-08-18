@@ -1,0 +1,42 @@
+# 对照实验：R6 风格复合因子（t 加权、无衰减约束）× 现行多种子机制
+data:
+  source: parquet
+  root: data
+  benchmark: "000906.SH"
+  sync:
+    universe: csi800
+    start: "2021-01-01"
+    end: ""
+    incremental: true
+
+factors:
+  composite_weight: t
+  composite_require_decay: false
+
+model:
+  name: auto
+  n_splits: 5
+  horizons: [5, 10, 20, 40]
+  n_seeds: 3
+  label_mode: binary
+
+portfolio:
+  top_n: 30
+  target_vol: 0.10
+  stickiness: 0.90
+  band: 0.15
+  exposure_step: 0.25
+  turnover_cap: 0.30
+  min_overlap: 0.85
+  rebalance_freq: Q
+  beta_target: 0.5
+  beta_window: 60
+  beta_scale_max: 1.0
+
+backtest:
+  start: "2024-02-01"
+  end: "2026-07-31"
+  initial_cash: 1000000
+
+report:
+  title: "A股多因子概率决策系统 · R6风格复合因子对照（3种子）"
