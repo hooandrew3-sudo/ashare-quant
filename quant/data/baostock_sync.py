@@ -391,10 +391,38 @@ class BaoStockSync:
 def merge_incremental(existing: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
     """增量合并：同 (date, symbol) 以新数据为准，去重后按时间排序。"""
     if existing is None or existing.empty:
-        return new.sort_values(["symbol", "date"]).reset_index(drop=True)
+        return normalize_flag_columns(new).sort_values(["symbol", "date"]).reset_index(drop=True)
     combined = pd.concat([existing, new], ignore_index=True)
     combined = combined.drop_duplicates(subset=["date", "symbol"], keep="last")
+    combined = normalize_flag_columns(combined)
     return combined.sort_values(["symbol", "date"]).reset_index(drop=True)
+
+
+FLAG_COLUMNS = (
+    "is_limit_up",
+    "is_limit_down",
+    "is_limit_up_open",
+    "is_limit_down_open",
+    "is_suspended",
+    "is_st",
+)
+
+
+def normalize_flag_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """把涨跌停/停牌/ST 标记列规范化为 bool，NaN（历史数据缺列）按 False 处理。
+
+    增量合并时旧数据可能缺失新列（如 is_limit_up_open），pd.concat 会把整列
+    抬升为 float64/object，导致 fastparquet 无法推断类型而落盘失败。
+    """
+    if df.empty:
+        return df
+    cols = [c for c in FLAG_COLUMNS if c in df.columns]
+    if not cols:
+        return df
+    out = df.copy()
+    for c in cols:
+        out[c] = out[c].fillna(False).astype(bool)
+    return out
 
 
 def incremental_window(manifest: dict | None, dataset: str, end: str, buffer_days: int = 5) -> str:

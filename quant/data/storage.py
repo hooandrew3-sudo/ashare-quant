@@ -10,6 +10,7 @@ from typing import Optional
 
 import pandas as pd
 
+from quant.data.baostock_sync import normalize_flag_columns
 from quant.utils import ensure_dir, sha256_df
 
 
@@ -104,6 +105,7 @@ class Storage:
             return pd.DataFrame()
         frames = [pd.read_parquet(p) for p in parquet_files]
         df = pd.concat(frames, ignore_index=True)
+        df = normalize_flag_columns(df)
         datetime_cols = df.select_dtypes(include=["datetime64"]).columns
         if len(datetime_cols):
             for col in datetime_cols:

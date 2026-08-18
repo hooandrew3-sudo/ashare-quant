@@ -41,6 +41,33 @@ def test_merge_incremental_dedup():
     assert overlap.iloc[0]["close"] == 101.5
 
 
+def test_merge_normalizes_flag_columns():
+    """旧数据缺新列（is_limit_up_open）时，合并后必须规范化为 bool 而非 float/NaN。"""
+    existing = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-02"]),
+            "symbol": ["600519.SH"],
+            "close": [100.0],
+            "is_limit_up": [False],
+        }
+    )
+    new = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-02", "2024-01-03"]),
+            "symbol": ["600519.SH", "600519.SH"],
+            "close": [100.5, 101.0],
+            "is_limit_up": [True, False],
+            "is_limit_up_open": [True, False],
+            "is_limit_down_open": [False, False],
+        }
+    )
+    merged = merge_incremental(existing, new)
+    assert merged["is_limit_up_open"].dtype == bool
+    assert merged["is_limit_up_open"].isna().sum() == 0
+    assert merged["is_limit_up"].dtype == bool
+    assert bool(merged.loc[merged["date"] == pd.Timestamp("2024-01-02"), "is_limit_up_open"].iloc[0])
+
+
 def test_incremental_window():
     manifest = {
         "datasets": {

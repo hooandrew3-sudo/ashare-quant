@@ -1,0 +1,325 @@
+A股多因子概率决策系统 · 二次深度审核报告（一轮优化后复验）
+
+审核视角：顶级A股量化交易员 + 策略设计师 + 工业级工程审核
+审核日期：2026-08-18
+审核方法：全量核心代码逐文件复核 + artifacts 产物核对 + 上一轮审计报告（8-13 / 8-14）逐条闭环验证
+
+──────────────────────────────────────────────────────────────────────────────
+
+一、总体判断
+
+系统工程质量 7.5/10，策略实战可用性 5.5/10，生产就绪度 2/10。
+
+架构完成度在个人系统中仍属顶尖，但经过上一轮审计后，团队将精力集中在策略迭代与 A/B 实验矩阵上，上一轮指出的 P0 级工程债（ neutralize 性能炸弹、turnover_breached O(n²)、PaperBroker 前视风险、Storage 全量扫描）**全部原样保留**。与此同时，新增的 consensus_revision 因子、no_buy_today 竞态保护、open-limit 撮合标记等特性，在执行路径上增加了新的正确性风险面。
+
+核心结论：这一轮"优化"是策略层面的伪优化。代码行数增加了，实验矩阵变丰富了，但"研究系统"到"生产交易系统"之间最关键的工程债务没有偿还。离工业级生产要求的距离没有缩短，反而因为执行路径更复杂而略有增加。
+
+──────────────────────────────────────────────────────────────────────────────
+
+二、本轮"优化"实际做了什么（逐文件核实）
+
+quant/backtest/engine.py:
+  - 新增 no_buy_today 集合（同止损股当日禁止回买）
+  - 现金不足反解循环（while max_shares > 0 精确逼近）
+  - _execute 增加 no_buy_today 参数
+  - rebalance 买单也带 days_left（可顺延）
+  评价：细节修复到位，但改变了撮合语义（见 2.3）；buy 带 days_left 可能导致调仓日从 crisp cut 变为调仓窗口
+
+quant/backtest/fills.py:
+  - 新增 _flag 辅助，支持 is_limit_up_open / is_limit_down_open 开盘一字板标记
+  - 老数据无该列时回退到收盘封板标记（保守近似）
+  评价：正确改进，符合 A 股撮合实际
+
+quant/factors/definitions.py:
+  - 新增 consensus_revision 因子（30 日一致预期 EPS 修正率）
+  - quality 因子增加注释文档化"稳定性维度"的负结果（ICIR 从 0.364 打到 0.032）
+  - 注释掉 earnings_forecast 因子（回测塌方负结果记录）
+  评价：可复现性提升，但 consensus 有前视风险（见 2.1）
+
+quant/data/consensus_ths.py + quant/scheduler.py:
+  - 新增每日采集 top-200 一致预期快照的调度逻辑
+  评价：采集频率和 PIP 对齐存疑（见 2.1）
+
+configs/:
+  - 新增 real_2018.yaml（长窗口 15 折 WF）、real_r6.yaml（t 加权对照）
+  评价：实验管理规范化
+
+本轮未动的（上一轮 P0/P1 全部原样保留）：
+  - _neutralize iterrows 性能炸弹
+  - _turnover_breached O(n²) 每步重建 DataFrame
+  - compute_beta_scale 每步全量构建
+  - _monthly calendar month end 与调仓日脱节
+  - benchmark 逐行 loc 线性扫描
+  - PaperBroker._last_price 无日期上界
+  - 等权 Top-N 丢信号强度
+  - 行业约束踢最后一名而非最差一名
+  - Storage.load() 全量扫描
+
+──────────────────────────────────────────────────────────────────────────────
+
+三、本轮新发现但未被记录的正确性风险
+
+3.1 consensus_revision 因子存在潜在前视偏差（P1）
+
+代码位置：quant/data/consensus_ths.py（调度器 lines 33-46）、quant/factors/definitions.py:141-155
+
+每日采集 top-200 的一致预期 EPS 快照，再用 30 日 shift 计算修正率。风险点：
+  - 一致预期数据源的 as_of_date 标注是否精确到"公告发布次日开盘前"？若采集发生在盘后，快照可能已包含当日已公开信息，与次日开盘价的回测撮合之间存在 4~6 小时的前视窗口。
+  - 当前代码对不足 30 日快照直接 fillna(0.0)，这意味着早期样本（>=2021-01 的前 40 个交易日）该因子恒为 0，训练集前段被静默注入了大量无信息噪声。
+  - 模型在前 40 日可能学到"该特征可忽略"——但这与样本外行为不一致，构成时间维度上的分布偏移。
+
+修复建议：
+  1. 在 consensus_ths.py 增加 release_date（公告发布日期）与 fetch_date（采集日期）双时间戳，回测只消费 release_date <= T-1 的快照。
+  2. 在 _f_consensus_revision 增加有效性掩码：若 aligned.shift(30) 缺失（即快照历史不足 30 日），返回 NaN 而非 0.0，让下游 _winsorize_zscore 用截面中位数填充。
+
+3.2 no_buy_today 与 rebalance 队列的竞态条件（P1）
+
+代码位置：quant/backtest/engine.py:115-116
+
+队列顺序：
+  1. Step 3：止损/熔断/CVaR 卖出 → 入队（目标 exec_date = 次日）
+  2. Step 4：_schedule_rebalance 生成次日调仓单 → 入队（目标 exec_date = 次日）
+  3. Step 5：按队列顺序执行
+
+当前代码中，止损卖出先入队（step 3），rebalance 买入后入队（step 4），因此 execute 时先卖后买，no_buy_today 能阻断回补。但这依赖队列顺序是"风控单先于调仓单"。
+
+风险：若未来有人调整 _schedule_rebalance 的调用时机（如提前到 step 2.5），或增加其他前置检查，队列顺序反转会导致当日止损卖出、当日回补，与 A 股 T+1 制度冲突。
+
+修复建议：将 no_buy_today 逻辑从"执行时人工阻断"下沉到 _schedule_rebalance 的"可用标的过滤层"——在生成买入目标前，先剔除当天已被风控卖出的标的。
+
+3.3 rebalance 买单带 days_left 改变了撮合语义（P2）
+
+上一轮代码中，rebalance 买单的 days_left: 0，意味着不可顺延。本轮改为 postpone_max_days。导致：
+  - 回测中"季度调仓日"不再是一个 sharp cut，而是变成了"调仓窗口"（最多 5 个交易日分批执行）。
+  - 影响收益归因：如果某只股票在调仓后第 3 天复牌且大涨，系统可能在那天才买到，但回测报告中仍把"调仓日"记为 T+1。
+
+修复建议：将 rebalance 买单的 days_left 恢复为 0（不可顺延），风控单（止损/熔断）保留 postpone_max_days。流动性不足应在 Universe filter（_universe_ok）阶段剔除，而非在撮合层顺延。
+
+3.4 _f_earnings_forecast 被注释但 _attach_forecast 仍执行（P2）
+
+代码位置：quant/factors/definitions.py:169-171、quant/factors/compute.py:21
+
+每轮 compute_all_factors 都会执行 _attach_forecast，merge_asof 把 forecast_growth 拼到 prices 长表中，只是结果未被使用。这在日频 1007 只股票规模下是 dead compute。
+
+修复建议：将 _attach_forecast 的调用改为条件执行（仅当 "forecast_growth" 在 FACTOR_SPECS 活跃列表中时）。
+
+──────────────────────────────────────────────────────────────────────────────
+
+四、上一轮指出的核心问题为何仍未修？（根本原因分析）
+
+根据代码目录时序和 artifacts 命名（long_real_baseline_equal_20260818_*、mode_test_*、ab_*），这一轮的核心产出是 A/B 实验框架 + 多种子/多周期对照，而非工程重构。
+
+这意味着团队精力集中在：
+  - 策略迭代（risk_budget vs equal weight、hybrid vs model vs composite 选股模式）
+  - 对照实验（t 加权 vs icir 加权、带 decay vs 不带 decay）
+  - 长窗口验证（2018 起回测、15 折 WF）
+
+而上一轮指出的 neutralize iterrows、Storage 全量扫描、PaperBroker 前视等问题，属于底层基础设施债务——它们不直接影响"某一版策略的收益率数字"，因此被策略迭代的优先级压后。
+
+这在机构量化团队中属于典型错位：研究岗追求回测数字好看，工程岗追不上研究迭代速度。当"P3 前置已完成"这种里程碑写在 PRODUCTION_SPEC.md 里时，会产生一种虚假的完成感。
+
+──────────────────────────────────────────────────────────────────────────────
+
+五、重新评估回测可信度与过拟合风险
+
+5.1 数字层面的诚实评估
+
+从 artifacts 目录命名看，团队在进行 baseline_equal vs risk_budget 的 A/B 测试。但上一轮审计的核心警告仍然成立：
+
+  - 年化 22-37%、Sharpe 2.1-2.9、回撤 -4.5% ~ -9.9%：在同一宇宙（CSI800 + 退市股 1007 只）、同一因子体系下，不同配置能跑出 37% -> 22% 的波动，说明策略收益对 rebalance_freq（M vs Q）、weight_method（equal vs risk_budget）、composite_weight（t vs icir）极度敏感。
+  - 这种参数敏感性本身就是过拟合的前兆。如果策略 alpha 是真实的，切换季度调仓不应该导致年化从 37% 变 22%。
+
+5.2 Beta 0.24 的防御型组合 + 极低回撤
+
+Beta 持续在 0.24-0.26 之间，组合系统性风险暴露不到市场的 1/4。在 A 股 2018-2026 的完整周期中，一个 beta 0.24 的组合几乎全是 alpha。在 CSI800 universe 中，这种 alpha 水平极罕见，可能暗示：
+  1. 幸存者偏差残余：历史成员 proxy 未覆盖"曾入选 800 但后调出且未退市"的股票。
+  2. 低 beta 的 Jan 效应放大：小市值/低波因子在 2021-2024 的风格漂移中被 regime 状态机放大。
+  3. 因子方向洗出：vol_ratio / industry_mom 方向反但被 composite |IC| 掩盖，模型实际在学反转逻辑。
+
+5.3 特修斯之船问题
+
+从 8-13 到 8-14 再到 8-18，代码经历了：
+  - 复合因子权重：icir -> t -> 无约束
+  - 调仓频率：M -> Q
+  - 行业中性化：证监会 20 类 -> baostock 真实行业
+  - 因子数：10 -> 13 -> 14（含 consensus_revision）
+  - 止损：固定 12% -> 引入 ATR 讨论（未落地）
+  - 权重：等权 -> risk_budget（A/B 测试中）
+
+每一次改动都会产生新的 run_id + metrics.json。按 Deflated Sharpe 打折纪律，这 15+ 次运行面对的是多重检验惩罚。但报告中没有看到任何 p-value 调整或 Bonferroni/Sidak 校正。
+
+最危险的不是某个具体的数值，而是团队对"优化轮次"的自我感觉良好。上一轮审计的 P0 清单在这里完全适用，一字未改，且被当前代码逐条证实未解决。
+
+──────────────────────────────────────────────────────────────────────────────
+
+六、本轮新发现但未被记录的工程隐患
+
+6.1 scheduler.py 的一致预期采集是静默失败（P2）
+
+代码位置：quant/scheduler.py:33-46
+
+采集失败只打 warning，不阻断流水线。若东财/同花顺接口被墙或改版，snapshot 连续 30 天空跑，consensus_revision 因子始终为 0。但 live_signals 不会报警，因为因子层对缺失数据静默填充 0。这意味着一个多因子策略在无声无息中退化为少因子策略。
+
+修复建议：引入因子健康度哨兵——若连续 5 日某因子的截面覆盖度（non-null ratio）< 30%，在 metrics 中标记 factor_coverage_alert，并在 scheduler 中升级为 RuntimeError 或至少触发 P1 告警。
+
+6.2 tests/ 覆盖的盲区扩大
+
+上一轮有 test_backtest.py、test_paper.py、test_pipeline.py。本轮新增了 tests/test_optimization.py、tests/test_alerts.py、scripts/smoke_pipeline.py。
+
+但关键回归测试仍然缺失：
+  1. PaperBroker vs BacktestEngine 对账：至今没有测试验证"同一策略、同一信号日，paper 与 backtest 的换手/成本/净值 diff < 1%"。
+  2. incremental sync 确定性：storage.load() 在合并增量 parquet 后，若存在跨日重叠，merge_incremental 的去重逻辑是否幂等？
+  3. consensus 前视：没有单元测试验证 _f_consensus_revision 在 release_date 晚于 trade_date 时是否被正确过滤。
+  4. no_buy_today 竞态：没有测试覆盖"同一天内，止损卖出 A + rebalance 买入 A"的交互场景。
+
+──────────────────────────────────────────────────────────────────────────────
+
+七、本轮优化后修订的生产 Go/No-Go Checklist
+
+P0（上线前必须修，否则禁止 paper/实盘）
+
+  [ ] _neutralize 向量化改造：当前 1007 只 x 1000 日 ~= 100 万次 Python 层 OLS。目标：全因子 neutralize < 2 分钟。
+  [ ] PaperBroker._last_price 添加日期上界：series[series.index <= pd.Timestamp(self.trade_date)]。当前代码在数据碰脏时会产生前视。
+  [ ] build_target_weights 行业约束踢除逻辑修 worst-score-first：chosen_df.sort_values("score").iloc[0] 而非 .iloc[-1]。
+  [ ] 模型上线 Gate（Model Gate）：在 quant/model/registry.py 增加 is_qualified_for_live()：
+      - OOS AUC > 0.55 且 Rank IC > 0.02
+      - passed_factors >= 3
+      - 近 20 日 IC 未触发 alert
+      - 不满足时 --step live / --step paper 硬失败。
+
+P1（上线前强烈建议，否则纸面结果不可信）
+
+  [ ] BacktestEngine 与 PaperBroker 统一撮合路径：将 FillSimulator + CostModel 注入 PaperBroker。添加 CI 门禁：paper_nav_change - backtest_nav_change < 0.5% per rebalance day。
+  [ ] _turnover_breached 改为 rolling deque：维护 collections.deque(maxlen=252) 存储逐日 (buy_amount, sell_amount, avg_equity)。
+  [ ] compute_beta_scale 改为增量维护：在 equity_rows 上维护 rolling p 和 b 的 deque，每步增量更新协方差。
+  [ ] benchmark 在 __init__ 时 set_index：self._bench = self.benchmark.set_index("date")["close"]。
+  [ ] _monthly 改用 rebalance_dates 分组：季度调仓时，月度收益应基于季度末最后一个调仓日。
+
+P2（影响长期稳定性，建议 4 周内落地）
+
+  [ ] consensus_revision 前视防护：增加 release_date <= trade_date - 1 掩码；快照不足 30 日时返回 NaN 而非 0。
+  [ ] rebalance 买单恢复 days_left: 0：保持调仓日 crisp cut，流动性不足应在 Universe filter 阶段剔除。
+  [ ] 信号强度加权：从等权改为 score_rank ** 1.5 幂加权。
+  [ ] 行业约束踢除逻辑改为 worst-score-first。
+  [ ] 异常处理分层：except (ConnectionError, TimeoutError) -> 重试；except ValueError -> 跳过并标记；except Exception -> 告警 abort。
+
+P3（锦上添花）
+
+  [ ] 因子覆盖度哨兵：连续 5 日某因子 non-null 率 < 30% -> P1 告警。
+  [ ] Docker 运行时固化：python:3.11-slim + lightgbm==4.3.0 + pandas==2.2.2 + pyarrow==14.0，产物附带 runtime_lock.yaml。
+  [ ] CI/CD 回归门禁：每日跑 data quality + factor IC + backtest metrics 回归，Sharpe 环比下降 > 15% 或 max_dd 变差 > 2% 绝对 -> fail。
+
+──────────────────────────────────────────────────────────────────────────────
+
+八、修订后的上线时间线（现实版）
+
+W1-W2：P0 工程债偿还
+  - _neutralize 向量化
+  - _turnover_breached deque
+  - PaperBroker 日期上界
+  - benchmark index 优化
+  验收：全因子计算时间 < 5 分钟；paper/backtest 同日期 diff < 0.5%
+
+W3：P1 正确性修复
+  - BacktestEngine 与 PaperBroker 统一撮合
+  - days_left 语义澄清（rebalance 恢复 0）
+  - 行业约束 worst-first
+  验收：回测与纸面换手率差异 < 10%
+
+W4：P1 策略 gate + 因子哨兵
+  - 模型上线门禁
+  - consensus 前视防护
+  - 异常处理分层
+  验收：--step live 对不达标模型硬失败
+
+W5-W8：纸面交易 4 周
+  - 每日三方对账（backtest vs paper vs shadow）
+  验收：对账报告，日度 NAV diff < 0.3%，累计费用 diff < 5%
+
+W9-W16：小资金 10 万实盘 2 个月
+  验收：月度胜率 >= 60%，最大回撤 <= 目标+3%，无下单事故
+
+W17+：达标后按 1x -> 3x -> 10x 放量
+  验收：每阶段运行 >= 3 个月，监控指标稳定
+
+──────────────────────────────────────────────────────────────────────────────
+
+九、最终判断
+
+这轮优化做了正确的事（增加了可复现性、边缘 case 处理、实验矩阵），但没做最难的事（解耦执行层、向量化瓶颈、前视防护）。
+
+直接回答：当前状态离"工业级生产"比上一轮更远了，不是更近了。代码行数增加了，执行路径变复杂了，但核心阻塞项数量不变。建议冻结所有新策略特性，用 2-3 周集中偿还上一轮 P0 工程债，再进行下一轮策略迭代。
+
+──────────────────────────────────────────────────────────────────────────────
+
+十、附录：代码级证据索引
+
+A. _neutralize 性能炸弹（未修复）
+   文件：quant/factors/compute.py:185-200
+   代码：for dt, row in out.iterrows(): ... np.linalg.lstsq(X[mask], y[mask], rcond=None)
+   影响：1007 只 x 1000 日 = 100 万次 OLS，总计 15-30 分钟
+
+B. _turnover_breached O(n²)（未修复）
+   文件：quant/backtest/engine.py:330-367
+   代码：trades = pd.DataFrame(trade_rows[-5000:]) ... 每次调仓重建
+   影响：360 次调仓 x 5000 行 = 180 万次冗余构造
+
+C. compute_beta_scale 每步全量构建（未修复）
+   文件：quant/backtest/engine.py:506-526
+   代码：eq = pd.DataFrame(equity_rows).set_index("date") ... np.polyfit
+   影响：数千次 O(n) 回归
+
+D. _monthly calendar month end 与调仓日脱节（未修复）
+   文件：quant/backtest/engine.py:483-495
+   代码：m = e["portfolio_value"].resample("ME").last()
+   影响：部分月份月度收益基准错位
+
+E. PaperBroker._last_price 无日期上界（未修复）
+   文件：quant/execution/paper.py:46-50
+   代码：series = self._close[symbol].dropna(); return float(series.iloc[-1])
+   影响：数据碰脏时产生前视
+
+F. 等权 Top-N 丢信号强度（未修复）
+   文件：quant/portfolio/selection.py:148-149
+   代码：w = 1.0 / len(chosen_df)
+   影响：第 1 名与第 30 名权重相同
+
+G. 行业约束踢最后一名而非最差一名（未修复）
+   文件：quant/portfolio/selection.py:125
+   代码：drop_sym = chosen_df[chosen_df["industry"] == worst_industry].iloc[-1]["symbol"]
+   影响：可能踢掉得分靠前的股票，保留得分靠后的
+
+H. Storage.load() 全量扫描（未修复）
+   文件：quant/data/storage.py:98-111
+   代码：frames = [pd.read_parquet(p) for p in parquet_files]; df = pd.concat(frames)
+   影响：1007 只股票、180 万行 prices 单次 2-4GB 内存 + 3-5 秒
+
+I. 模型上线 Gate 缺失（未修复）
+   文件：quant/pipeline.py:505-567
+   代码：live_signals 直接拿最新模型出信号，无 OOS AUC / IC / drift 检查
+   影响：不达标模型可直出纸面/实盘信号
+
+J. benchmark 逐行 loc 扫描（未修复）
+   文件：quant/backtest/engine.py:127
+   代码：bench_close = float(self.benchmark.loc[self.benchmark["date"] == date, "close"].iloc[0])
+   影响：7200 次循环 x 7200 行 ~= 5000 万次字符串比较
+
+K. 新增：consensus_revision 前视风险
+   文件：quant/data/consensus_ths.py + quant/factors/definitions.py:141-155
+   代码：aligned = p.consensus.reindex(index=p.close.index, method="ffill"); rev = aligned / aligned.shift(30) - 1.0
+   影响：as_of_date 标注不精确时，盘后采集的快照可能前瞻次日开盘价
+
+L. 新增：rebalance 买单 days_left 改变撮合语义
+   文件：quant/backtest/engine.py:307 / 328
+   代码：'days_left': self.bt.postpone_max_days
+   影响：季度调仓日从 sharp cut 变为调仓窗口，收益归因失真
+
+M. 新增：scheduler.py 一致预期采集静默失败
+   文件：quant/scheduler.py:33-46
+   代码：except Exception as exc: log.warning("一致预期快照采集失败: %s", exc)
+   影响：连续失败不阻断，因子无声退化为 0
+
+──────────────────────────────────────────────────────────────────────────────
+
+报告生成时间：2026-08-18
+审核方法：全量核心代码逐文件复核 + artifacts 产物核对 + 上一轮审计报告逐条闭环验证
