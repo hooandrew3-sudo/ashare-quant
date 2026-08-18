@@ -84,3 +84,35 @@
 3. P1-8 标签对齐 T+1 开盘执行口径；
 4. P1-10 OMS 盘前风控 + QMT 订单对账；
 5. P1-7 行业中性化接入历史行业分类（或敏感性分析）。
+
+---
+
+## 当日故障处置补录（2026-08-18 晚）
+
+### 18:30 计划任务失败复盘
+- 直接原因：任务启动时（18:30）代码仍是修复前版本，800 只股票 × 3 次重试
+  空转 7514s 后以"未返回任何数据"失败；修复在 20:00 后才落地。
+- 处置：修复后用生产配置完整补跑：增量同步（800 只 / 4000 行 / 0 错误）→
+  生产模型重训 → 信号 → 纸面调仓 → 通知，全部通过
+  （`signals_2026-08-18.csv`、paper 账户 39 笔订单全部成交）。
+
+### 连带修复
+1. **策略指纹门禁**：[config.py](../quant/config.py) 新增
+   `strategy_fingerprint()`（仅锁 factors/model/portfolio）；live 推理改用
+   该指纹，每日任务的 `--source/--universe` 数据层覆盖不再误触发"需重训"；
+   旧模型（无 strategy_fingerprint）降级为告警。
+2. **consensus 透视崩溃**：[compute.py](../quant/factors/compute.py)
+   `build_panels` 快照表按 `as_of_date` 透视（此前固定按 `date`，一旦
+   consensus 数据累积即 KeyError）。
+3. **flag 列类型崩溃**：[baostock_sync.py](../quant/data/baostock_sync.py) +
+   [storage.py](../quant/data/storage.py) 增量合并/读取时把涨跌停/停牌/ST
+   标记列规范化为 bool（旧数据缺新列导致 object 混合类型，fastparquet
+   落盘失败）。
+4. **训练性能**：[train.py](../quant/model/train.py) + [pipeline.py](../quant/pipeline.py)
+   特征宽表只构建一次，多周期 × 多种子复用（此前 12 次重复 pivot 百万行）。
+5. **产物完整性**：live_signals 只认含 meta.json 的完整模型（训练中断的
+   半成品不得参与推理）。
+
+### 生产模型基线（real.yaml 指纹 797ba5f8960f）
+- 60 folds（4 周期 × 3 种子 × 5 折）；OOS AUC 0.5007、Rank IC 0.0136；
+  部署校准器（isotonic）已随模型持久化，后续每日任务走严格策略指纹门禁。
