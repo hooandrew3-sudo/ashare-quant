@@ -214,7 +214,11 @@ class Config:
                 "例如 data_demo。"
             )
         _validate_enum("data.source", self.data.source, {"synthetic", "baostock", "parquet"})
-        _validate_enum("data.sync.universe", self.data.sync.universe, {"manual", "csi800", "all"})
+        _validate_enum(
+            "data.sync.universe",
+            self.data.sync.universe,
+            {"manual", "csi800", "csi800_delisted", "all"},
+        )
         _validate_enum(
             "model.selection_mode",
             self.model.selection_mode,
