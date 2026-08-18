@@ -269,7 +269,17 @@ def run_research(
     ][: max(0, min_features - len(selected))]
     selected = selected[: cfg.factors.top_n]
     log.info("入选因子: %s", selected)
-    xy = prepare_xy(factor_long, label_long, cfg, factor_names=selected)
+    # 特征宽表只构建一次（多周期 × 多种子复用，避免重复 pivot 百万行因子表）
+    feats_wide = factor_long[factor_long["factor"].isin(selected)].pivot_table(
+        index=["date", "symbol"], columns="factor", values="value"
+    )
+    feats_wide = feats_wide[[c for c in selected if c in feats_wide.columns]]
+    feats_wide = feats_wide.rename(
+        columns={c: f"f_{c}" for c in selected if c in feats_wide.columns}
+    )
+    xy = prepare_xy(
+        factor_long, label_long, cfg, factor_names=selected, feats_wide=feats_wide
+    )
     feature_cols = [c for c in xy.columns if c.startswith("f_")]
     if len(feature_cols) == 0:
         raise RuntimeError("无可用于建模的因子特征")
@@ -282,7 +292,9 @@ def run_research(
     seeds = cfg.model.seeds[: cfg.model.n_seeds] if cfg.model.n_seeds > 1 else [cfg.run.seed]
     for h in horizons:
         label_h = build_label(bundle.prices, bundle.benchmark, cfg, horizon=h)
-        xy_h = prepare_xy(factor_long, label_h, cfg, factor_names=selected)
+        xy_h = prepare_xy(
+            factor_long, label_h, cfg, factor_names=selected, feats_wide=feats_wide
+        )
         for seed in seeds:
             res_h = walk_forward(xy_h, cfg, feature_cols, log=log, seed=seed)
             key = f"{h}_{seed}"

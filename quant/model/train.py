@@ -14,15 +14,24 @@ def prepare_xy(
     label_long: pd.DataFrame,
     cfg: Config,
     factor_names: list[str] | None = None,
+    feats_wide: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """因子长表 → 特征宽表（date, symbol, feat_*, label, excess）。"""
+    """因子长表 → 特征宽表（date, symbol, feat_*, label, excess）。
+
+    feats_wide 可传入预构建的特征宽表（多周期/多种子训练复用，避免重复 pivot
+    百万行因子表；列名须已带 f_ 前缀）。
+    """
     names = factor_names or sorted(factor_long["factor"].unique().tolist())
-    filtered = factor_long[factor_long["factor"].isin(names)]
-    feats = filtered.pivot_table(index=["date", "symbol"], columns="factor", values="value")
-    feats = feats[[c for c in names if c in feats.columns]]
+    if feats_wide is None:
+        filtered = factor_long[factor_long["factor"].isin(names)]
+        feats = filtered.pivot_table(index=["date", "symbol"], columns="factor", values="value")
+        feats = feats[[c for c in names if c in feats.columns]]
+        feats = feats.rename(columns={c: f"f_{c}" for c in names if c in feats.columns})
+    else:
+        feats = feats_wide
     labels = label_long.set_index(["date", "symbol"])[["excess", "value"]]
     df = feats.join(labels, how="inner").reset_index()
-    return df.rename(columns={c: f"f_{c}" for c in names if c in df.columns})
+    return df
 
 
 def _make_model(cfg: Config, seed: int | None = None):
