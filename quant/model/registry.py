@@ -49,6 +49,7 @@ class ModelRegistry:
             "run_id": run_id,
             "created_at": datetime.now().isoformat(),
             "config_fingerprint": cfg.fingerprint(),
+            "strategy_fingerprint": cfg.strategy_fingerprint(),
             "data_fingerprint": data_fingerprint,
             "feature_cols": result.get("feature_cols", []),
             "horizons": sorted(models.keys()) if models else [cfg.model.horizon],

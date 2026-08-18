@@ -9,6 +9,7 @@ from quant.data.synthetic import generate_synthetic
 from quant.factors.analysis import factor_ic_report, report_to_frame
 from quant.factors.compute import compute_all_factors
 from quant.model.label import build_label
+from quant.data.storage import DataBundle
 
 
 def _cfg() -> Config:
@@ -32,6 +33,33 @@ def test_factor_computation_shapes():
     # 13 个基础因子 + consensus_revision（分析师一致预期修正，数据不足时恒 0）
     assert n_factors == 14
     assert factor_long["value"].notna().mean() > 0.5
+
+
+def test_consensus_snapshot_does_not_crash():
+    """consensus 快照表（as_of_date 列）不得让因子管线崩溃（回归：2026-08-18）。"""
+    cfg = _cfg()
+    bundle = generate_synthetic(
+        n_stocks=cfg.data.demo.n_stocks,
+        years=cfg.data.demo.years,
+        seed=cfg.run.seed,
+    )
+    consensus = pd.DataFrame(
+        {
+            "symbol": bundle.prices["symbol"].unique()[:10].tolist(),
+            "as_of_date": pd.Timestamp("2026-08-10"),
+            "year": [2026] * 10,
+            "n_institutions": [3] * 10,
+            "eps_min": [1.0] * 10,
+            "eps_mean": [1.2] * 10,
+            "eps_max": [1.5] * 10,
+        }
+    )
+    bundle.consensus = consensus
+    factor_long = compute_all_factors(bundle, cfg)
+    rev = factor_long[factor_long["factor"] == "consensus_revision"]
+    assert not rev.empty
+    # 单日快照不足 30 个交易日位移 → 修正值应为 0（中性占位）
+    assert (rev["value"] == 0.0).all()
 
 
 def test_ic_report_structure():

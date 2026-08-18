@@ -42,9 +42,17 @@ def build_panels(bundle: DataBundle, cfg: Config) -> Panels:
     if hasattr(bundle, "consensus") and not bundle.consensus.empty:
         c = bundle.consensus.copy()
         c["as_of_date"] = pd.to_datetime(c["as_of_date"], errors="coerce")
-        # 仅保留最近年度的一致预期
-        c = c.sort_values(["symbol", "year"]).drop_duplicates("symbol", keep="last")
-        consensus = _wide(c, "eps_mean") if "eps_mean" in c.columns else None
+        c = c.dropna(subset=["as_of_date"])
+        if c.empty:
+            consensus = None
+        else:
+            # 仅保留最近年度、最近快照的一致预期（快照表列为 as_of_date，透视前统一为 date）
+            c = (
+                c.sort_values(["symbol", "as_of_date", "year"])
+                .drop_duplicates("symbol", keep="last")
+                .rename(columns={"as_of_date": "date"})
+            )
+            consensus = _wide(c, "eps_mean") if "eps_mean" in c.columns else None
 
     return Panels(
         close=_wide(prices, "close"),

@@ -199,6 +199,26 @@ class Config:
         blob = yaml.safe_dump(to_dict(self), sort_keys=True).encode("utf-8")
         return hashlib.sha256(blob).hexdigest()[:12]
 
+    def strategy_fingerprint(self) -> str:
+        """策略相关配置哈希（factors/model/portfolio）。
+
+        live 推理门禁用此指纹而非完整指纹：data.source / sync.universe 等
+        运行期覆盖（如每日任务 --source baostock --universe csi800）不应
+        触发"配置不一致"拒绝出信号；策略参数变化（因子集/模型/组合约束）
+        才必须重新训练。
+        """
+        import hashlib
+
+        blob = yaml.safe_dump(
+            {
+                "factors": to_dict(self.factors),
+                "model": to_dict(self.model),
+                "portfolio": to_dict(self.portfolio),
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(blob).hexdigest()[:12]
+
     def validate(self) -> None:
         """工业级配置校验：防止 synthetic 演示数据污染真实数据目录等事故。
 

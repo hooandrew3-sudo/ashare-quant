@@ -54,6 +54,17 @@ def test_config_enum_validation():
         raise AssertionError("非法枚举应触发 ValueError")
 
 
+def test_strategy_fingerprint_ignores_data_overrides():
+    """策略指纹只锁 factors/model/portfolio，数据源覆盖不应触发重训。"""
+    a, b = Config(), Config()
+    b.data.source = "baostock"
+    b.data.sync.universe = "csi800"
+    b.backtest.start = "2020-01-01"
+    assert a.strategy_fingerprint() == b.strategy_fingerprint()
+    b.model.n_splits = 7
+    assert a.strategy_fingerprint() != b.strategy_fingerprint()
+
+
 def test_demo_pipeline(tmp_path):
     cfg = Config()
     cfg.data.root = tmp_path / "data"

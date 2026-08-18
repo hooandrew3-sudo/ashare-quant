@@ -519,22 +519,31 @@ def live_signals(cfg: Config, output_root: str | Path = "artifacts") -> pd.DataF
     bundle = storage.load_bundle()
     bundle.validate()
     registry = ModelRegistry(output_root)
-    runs = sorted([p.name for p in registry.root.iterdir() if p.is_dir()])
+    # 只认已写完 meta.json 的完整模型产物（训练中断的半成品不得参与推理）
+    runs = sorted(
+        p.name
+        for p in registry.root.iterdir()
+        if p.is_dir() and (p / "meta.json").exists()
+    )
     if not runs:
         raise RuntimeError("无已训练模型，请先运行 --step model")
     latest = registry.load_run(runs[-1])
     meta = latest.get("meta") or {}
-    if meta.get("config_fingerprint") and meta["config_fingerprint"] != cfg.fingerprint():
-        raise RuntimeError(
-            f"模型 {runs[-1]} 的配置指纹与当前配置不一致（{meta['config_fingerprint']} "
-            f"vs {cfg.fingerprint()}），请重新训练后再出信号"
-        )
-    data_fp = pd.util.hash_pandas_object(bundle.prices).sum()
-    if meta.get("data_fingerprint") is not None and str(meta["data_fingerprint"]) != str(data_fp):
+    sfp = meta.get("strategy_fingerprint")
+    if sfp:
+        if sfp != cfg.strategy_fingerprint():
+            raise RuntimeError(
+                f"模型 {runs[-1]} 的策略指纹与当前配置不一致（{sfp} vs "
+                f"{cfg.strategy_fingerprint()}）。因子/模型/组合参数已变更，"
+                "请按当前配置重新训练后再出信号。"
+            )
+    else:
+        # 旧版本产物无 strategy_fingerprint：降级为告警而非阻断，
+        # 避免每日任务因历史模型归档缺失而中断；强烈建议重训以启用严格门禁。
         log.warning(
-            "数据指纹与训练时不匹配（训练 %s vs 当前 %s）：日常增量同步属预期；"
-            "若数据范围/宇宙变更，请重训",
-            meta["data_fingerprint"], data_fp,
+            "模型 %s 缺少 strategy_fingerprint（旧版本产物），跳过严格策略指纹校验；"
+            "建议用当前配置重训一次以启用门禁",
+            runs[-1],
         )
     models = latest.get("models") or {}
     if not models and latest.get("model") is None:
