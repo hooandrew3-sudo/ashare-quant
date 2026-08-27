@@ -111,7 +111,8 @@ def build_target_weights_with_risk_budget(
     industry: pd.DataFrame,
     cfg: PortfolioConfig,
     rebalance_dates: list[pd.Timestamp],
-    prev_weights: Optional[pd.DataFrame] = None,
+    prev_weights: pd.DataFrame | None = None,
+    constituents: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """风险预算版目标权重生成。
 
@@ -145,20 +146,29 @@ def build_target_weights_with_risk_budget(
             continue
 
         sc = scores_by_date[date].copy()
+        # 点内成分过滤（与 selection 同语义，消除幸存者偏差）
+        if constituents is not None and not constituents.empty:
+            from quant.portfolio.selection import members_asof
+
+            mem = members_asof(constituents, date)
+            if mem is not None:
+                sc = sc[sc.index.isin(mem)]
         sc = sc.set_index("symbol")["score"]
 
-        # 可交易过滤
+        # 可交易过滤（先按 sc.index 对齐，防止 scores 含当日无行情的 symbol 时
+        # 布尔索引抛 Unalignable 异常导致整个回测中断）
         day = prices[prices["date"] == date].set_index("symbol")
         if day.empty:
             continue
+        day = day.reindex(sc.index)
         if "is_st" in day.columns:
-            sc = sc[~day["is_st"].astype(bool)]
+            sc = sc[~day["is_st"].fillna(False).astype(bool)]
         if "is_suspended" in day.columns:
-            sc = sc[~day["is_suspended"].astype(bool)]
+            sc = sc[~day["is_suspended"].fillna(False).astype(bool)]
         if "is_limit_up" in day.columns:
-            sc = sc[~day["is_limit_up"].astype(bool)]
+            sc = sc[~day["is_limit_up"].fillna(False).astype(bool)]
         if "close" in day.columns:
-            sc = sc[day["close"] > 0]
+            sc = sc[(day["close"] > 0).fillna(False)]
         # 流动性过滤
         if "amount" in day.columns:
             recent = (
@@ -231,8 +241,15 @@ def build_target_weights_with_risk_budget(
                 if len(chosen_df) < min_count:
                     break
             chosen_df["weight"] = chosen_df["weight"] / chosen_df["weight"].sum()
-        chosen_df["weight"] = np.clip(chosen_df["weight"], 0.0, cfg.max_weight)
-        chosen_df["weight"] = chosen_df["weight"] / chosen_df["weight"].sum()
+        # 单票上限：water-filling 投影（clip 后归一化会把权重重新抬过上限，
+        # 属约束失效；残额不分配 = 留现金，保守方向）
+        from quant.portfolio.selection import cap_weights_waterfill
+
+        capped = cap_weights_waterfill(chosen_df.set_index("symbol")["weight"], cfg.max_weight)
+        chosen_df["weight"] = chosen_df["symbol"].map(capped).to_numpy()
+        assert (chosen_df["weight"] <= cfg.max_weight + 1e-6).all(), (
+            f"risk_budget 单票权重上限被击穿: max={chosen_df['weight'].max():.4f}"
+        )
 
         chosen_df["date"] = date
         out.append(chosen_df[["date", "symbol", "weight"]])

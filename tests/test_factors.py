@@ -32,7 +32,7 @@ def test_factor_computation_shapes():
     assert set(["date", "symbol", "factor", "value"]).issubset(factor_long.columns)
     n_factors = factor_long["factor"].nunique()
     # 13 个基础因子 + consensus_revision（分析师一致预期修正，数据不足时恒 0）
-    assert n_factors == 14
+    assert n_factors == 19  # 17 + earn_quality/ocf_growth（现金流族）
     assert factor_long["value"].notna().mean() > 0.5
 
 
@@ -141,7 +141,7 @@ def test_ic_report_structure():
     label_long = build_label(bundle.prices, bundle.benchmark, cfg)
     report = factor_ic_report(factor_long, label_long, cfg)
     assert "factors" in report
-    assert len(report["factors"]) == 14  # 13 基础 + consensus_revision
+    assert len(report["factors"]) == 19  # 含现金流质量族
     frame = report_to_frame(report)
     assert set(["factor", "ic_mean", "icir", "passed"]).issubset(frame.columns)
 

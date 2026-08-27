@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -18,6 +19,21 @@ from quant.portfolio.selection import build_target_weights
 from quant.utils import ensure_dir, setup_logging
 
 
+def _recent_avg_amount(prices: pd.DataFrame, as_of: pd.Timestamp, window: int = 20) -> pd.Series:
+    """近 N 日均成交额（symbol 索引），供 adaptive 滑点与回测同口径。"""
+    if prices.empty or "amount" not in prices.columns:
+        return pd.Series(dtype=float)
+    hist = prices[pd.to_datetime(prices["date"]) <= as_of]
+    if hist.empty:
+        return pd.Series(dtype=float)
+    recent = (
+        hist.sort_values("date")[["symbol", "amount"]]
+        .groupby("symbol", group_keys=False)
+        .tail(window)
+    )
+    return recent.groupby("symbol")["amount"].mean()
+
+
 def _benchmark_close(bundle, latest: pd.Timestamp) -> float | None:
     """取 latest 当日（或此前最近）的基准收盘价，用于与纸面组合对比。"""
     if bundle.benchmark.empty:
@@ -30,12 +46,19 @@ def _benchmark_close(bundle, latest: pd.Timestamp) -> float | None:
     return float(hist["close"].iloc[-1])
 
 
+def _atomic_write_csv(path: Path, df: pd.DataFrame) -> None:
+    """CSV 原子写：进程中断不会留下半个文件。"""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    df.to_csv(tmp, index=False)
+    os.replace(tmp, path)
+
+
 def _append_history(state_dir: Path, state: dict, bench_close: float | None) -> None:
     """每日一行净值历史（按 date 幂等追加），供收益/回撤/基准对比。"""
     init = float(state.get("initial_cash", 1_000_000.0))
     pnl = float(state["portfolio_value"]) - init
     row = {
-        "date": state["date"],
+        "date": str(pd.Timestamp(state["date"]).date()),
         "portfolio_value": float(state["portfolio_value"]),
         "cash": float(state["cash"]),
         "n_positions": int(len(state["positions"])),
@@ -48,22 +71,27 @@ def _append_history(state_dir: Path, state: dict, bench_close: float | None) -> 
     hist_path = state_dir / "history.csv"
     df = pd.DataFrame([row])
     if hist_path.exists():
-        old = pd.read_csv(hist_path)
+        old = pd.read_csv(hist_path, dtype={"date": str})
+        old["date"] = old["date"].astype(str).str[:10]
         old = old[old["date"] != row["date"]]
         df = pd.concat([old, df], ignore_index=True)
-    df.to_csv(hist_path, index=False)
+    _atomic_write_csv(hist_path, df)
 
 
 def _append_orders(state_dir: Path, orders: list[Order], date: pd.Timestamp) -> None:
-    """按 date 幂等追加订单流水（含成交价与费用），避免覆盖历史。"""
+    """按 date 幂等追加订单流水（含成交价与费用），避免覆盖历史。
+
+    此前去重比较用 Timestamp 与字符串比较恒为 False，同日重跑时订单重复累积。
+    """
+    day_str = str(pd.Timestamp(date).date())
     rows = [
         {
-            "date": date,
+            "date": day_str,
             "symbol": o.symbol,
             "side": o.side,
-            "shares": o.shares,
-            "price": o.price,
-            "fee": o.fee,
+            "shares": int(o.shares),
+            "price": float(o.price),
+            "fee": float(o.fee),
             "status": o.status.value,
             "reason": o.reason,
         }
@@ -72,10 +100,11 @@ def _append_orders(state_dir: Path, orders: list[Order], date: pd.Timestamp) -> 
     orders_path = state_dir / "orders.csv"
     df = pd.DataFrame(rows)
     if orders_path.exists():
-        old = pd.read_csv(orders_path)
-        old = old[old["date"] != str(date)]
+        old = pd.read_csv(orders_path, dtype={"date": str})
+        old["date"] = old["date"].astype(str).str[:10]
+        old = old[old["date"] != day_str]
         df = pd.concat([old, df], ignore_index=True)
-    df.to_csv(orders_path, index=False)
+    _atomic_write_csv(orders_path, df)
 
 
 def run_paper(
@@ -103,7 +132,12 @@ def run_paper(
         min_commission=cfg.backtest.min_commission,
         lot_size=cfg.backtest.lot_size,
     )
-    broker = PaperBroker(bundle.prices, initial_cash=cfg.backtest.initial_cash, cost=cost)
+    broker = PaperBroker(
+        bundle.prices,
+        initial_cash=cfg.backtest.initial_cash,
+        cost=cost,
+        avg_amount=_recent_avg_amount(bundle.prices, latest),
+    )
 
     if state_file.exists():
         state = json.loads(state_file.read_text(encoding="utf-8"))
@@ -146,6 +180,7 @@ def run_paper(
         cfg=cfg.portfolio,
         rebalance_dates=[latest],
         prev_weights=prev_weights if not prev_weights.empty else None,
+        constituents=getattr(bundle, "constituents", None),
     )
     if target.empty:
         raise RuntimeError("组合构建无目标持仓")
@@ -186,10 +221,15 @@ def run_paper(
             if shares > 0:
                 orders.append(Order(id=f"{stamp}_sell_{sym}", symbol=sym, side="sell", shares=shares, price=px))
 
-    oms = OrderManager(broker)
+    oms = OrderManager(
+        broker,
+        ledger_path=Path(output_root) / "paper" / "oms_ledger.json",
+    )
     for o in orders:
         oms.submit(o)
     filled = sum(1 for o in broker.get_orders() if o.status == OrderStatus.FILLED)
+    if oms.killed:
+        log.error("OMS 熔断：部分订单未提交（submitted=%d/%d）", filled, len(orders))
 
     state = {
         "date": latest_str,
@@ -209,11 +249,16 @@ def run_paper(
         "filled": filled,
         "target_symbols": sorted(target_syms),
     }
-    state_file.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
-    )
+    # 写入顺序：先流水（history/orders）后 state —— state.json 是"当日已完成"
+    # 的提交点。此前先写 state，若随后崩溃，同日重跑被守卫拦截，
+    # 当日净值/订单流水永久缺失。
     _append_history(state_dir, state, _benchmark_close(bundle, latest))
     _append_orders(state_dir, broker.get_orders(), latest)
+    tmp_state = state_file.with_suffix(".json.tmp")
+    tmp_state.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+    )
+    os.replace(tmp_state, state_file)
     log.info(
         "纸面调仓完成: %d 笔订单(成交 %d), 组合市值 %.2f, 持仓 %d 只, 累计费用 %.2f",
         len(orders), filled, state["portfolio_value"], len(state["positions"]), state["total_fees"],

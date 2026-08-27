@@ -60,6 +60,20 @@ def _decay_ok(r: dict, require: bool) -> bool:
     return True
 
 
+def _weights_of(report: dict, names: list[str], weight_by: str) -> dict[str, float]:
+    if weight_by == "icir":
+        return {
+            name: max(abs(report["factors"][name]["icir"] or 0.05), 0.05)
+            for name in names
+        }
+    if weight_by == "t":
+        return {
+            name: max(abs(report["factors"][name]["t_stat"] or 1.0), 0.1)
+            for name in names
+        }
+    return {name: 1.0 for name in names}
+
+
 def build_composite_factor(
     factor_long: pd.DataFrame,
     ic_report: dict,
@@ -68,8 +82,18 @@ def build_composite_factor(
     corr_max: float = 0.6,
     weight_by: str = "icir",  # icir | t | equal
     require_stable_decay: bool = True,
+    regime_bull_dates: "pd.DatetimeIndex | set | None" = None,
+    ic_report_bull: "dict | None" = None,
+    ic_report_bear: "dict | None" = None,
 ) -> pd.DataFrame:
-    """返回 composite 因子的 long 表；不足 2 个可用因子时返回空。"""
+    """返回 composite 因子的 long 表；不足 2 个可用因子时返回空。
+
+    regime 轮动（可选）：同时传入 regime_bull_dates（牛市日期集合）与
+    牛/熊两个分域 IC 报告时，成分与权重分别按分域估计，逐日按当日所处
+    状态选用——牛市偏进攻因子（动量/盈利改善），熊市偏防御因子
+    （价值/低波）。分域样本不足或选不出 ≥2 个成分时，该日回退全窗口
+    权重（保守降级，不产生空值）。
+    """
     corr = factor_correlations(factor_long)
     picks = _select_components(
         ic_report, corr, n, min_t, corr_max, require_stable_decay=require_stable_decay
@@ -78,17 +102,56 @@ def build_composite_factor(
         return pd.DataFrame(columns=["date", "symbol", "factor", "value"])
     sub = factor_long[factor_long["factor"].isin(picks)]
     wide = sub.pivot_table(index=["date", "symbol"], columns="factor", values="value")
-    if weight_by == "icir":
-        weights = {
-            name: max(abs(ic_report["factors"][name]["icir"] or 0.05), 0.05)
-            for name in picks
+
+    def _weighted(report: dict, names: list[str]) -> pd.Series:
+        w = _weights_of(report, names, weight_by)
+        total = sum(w.values())
+        out = None
+        for name, wv in w.items():
+            term = wide[name] * (wv / total)
+            out = term if out is None else out + term
+        return out
+
+    comp = _weighted(ic_report, picks)
+
+    # ---- regime 条件化 ----
+    if (
+        regime_bull_dates is not None
+        and ic_report_bull is not None
+        and ic_report_bear is not None
+    ):
+        import numpy as np
+
+        bull_picks = _select_components(
+            ic_report_bull, corr, n, min_t, corr_max, require_stable_decay=require_stable_decay
+        )
+        bear_picks = _select_components(
+            ic_report_bear, corr, n, min_t, corr_max, require_stable_decay=require_stable_decay
+        )
+        bull_set = {
+            pd.Timestamp(d) for d in (
+                list(regime_bull_dates)
+                if not isinstance(regime_bull_dates, (set, frozenset))
+                else regime_bull_dates
+            )
         }
-    elif weight_by == "t":
-        weights = {name: max(abs(ic_report["factors"][name]["t_stat"] or 1.0), 0.1) for name in picks}
-    else:
-        weights = {name: 1.0 for name in picks}
-    total = sum(weights.values())
-    weighted = sum(wide[name] * (w / total) for name, w in weights.items())
-    comp = weighted.rename("value").reset_index()
-    comp["factor"] = "composite"
-    return comp[["date", "symbol", "factor", "value"]]
+        date_index = wide.index.get_level_values("date")
+        is_bull = np.array([d in bull_set for d in date_index], dtype=bool)
+        bull_ok = len(bull_picks) >= 2
+        bear_ok = len(bear_picks) >= 2
+        if bull_ok or bear_ok:
+            # 分域成分可能与全窗口 picks 不同：按并集重建宽表，保证 _weighted 可索引
+            needed = set(picks) | set(bull_picks) | set(bear_picks)
+            if not needed <= set(wide.columns):
+                sub_all = factor_long[factor_long["factor"].isin(needed)]
+                wide = sub_all.pivot_table(
+                    index=["date", "symbol"], columns="factor", values="value"
+                )
+            bull_vals = _weighted(ic_report_bull, bull_picks).to_numpy(dtype=float) if bull_ok else comp.to_numpy(dtype=float)
+            bear_vals = _weighted(ic_report_bear, bear_picks).to_numpy(dtype=float) if bear_ok else comp.to_numpy(dtype=float)
+            merged = np.where(is_bull, bull_vals, bear_vals)
+            comp = pd.Series(merged, index=wide.index)
+
+    out = comp.rename("value").reset_index()
+    out["factor"] = "composite"
+    return out[["date", "symbol", "factor", "value"]]

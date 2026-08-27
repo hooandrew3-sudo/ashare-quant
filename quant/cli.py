@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from quant.config import load_config
+from quant.utils import process_lock
 
 
 def _print_summary(res: dict) -> None:
@@ -39,7 +40,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--step", type=str, default="all",
                         choices=["all", "data", "sync", "daily", "factors", "model",
                                  "backtest", "report", "live", "paper", "fundamentals",
-                                 "sentiment", "universe-history", "industry"],
+                                 "sentiment", "universe-history", "industry", "cashflow"],
                         help="执行阶段")
     parser.add_argument("--output", type=str, default="artifacts", help="产物根目录")
     parser.add_argument("--force", action="store_true", help="强制重算")
@@ -60,8 +61,29 @@ def main(argv: list[str] | None = None) -> int:
         cfg.data.root = Path(args.root)
     symbols = args.symbols.split(",") if args.symbols else None
 
+    # 进程级互斥锁：计划任务补跑 + 手工运行并发时会双写 paper state /
+    # 并发增量同步，属生产事故源。锁粒度 = 数据目录。
+    with process_lock(cfg.data.root):
+        return _dispatch(args, cfg, symbols, parser)
+
+
+def _dispatch(args, cfg, symbols, parser) -> int:
     from quant.data.storage import Storage
     from quant.pipeline import live_signals, prepare_data, run_research
+
+    # --demo 必须最先处理：此前排在 step 分支之后，当真实数据已存在时
+    # （data/processed/prices 非空）合成数据被静默跳过，直接用真实数据跑研究
+    if args.demo:
+        cfg.data.source = "synthetic"
+        # demo 与真实数据隔离，避免合成数据覆盖 data/processed
+        cfg.data.root = Path("artifacts/demo_data")
+        storage = Storage(cfg.data.root)
+        if not storage.has("prices") or args.force:
+            prepare_data(cfg)
+        bundle = storage.load_bundle()
+        res = run_research(cfg, bundle, args.output, force=args.force)
+        _print_summary(res)
+        return 0
 
     if args.step == "live":
         signals = live_signals(cfg, args.output)
@@ -91,6 +113,13 @@ def main(argv: list[str] | None = None) -> int:
 
         fund = prepare_fundamentals(cfg)
         print(f"财务数据完成: {len(fund)} 条, {fund['symbol'].nunique()} 只")
+        return 0
+
+    if args.step == "cashflow":
+        from quant.pipeline import prepare_cashflow
+
+        cf = prepare_cashflow(cfg)
+        print(f"现金流数据完成: {len(cf)} 条, {cf['symbol'].nunique()} 只")
         return 0
 
     if args.step == "industry":
@@ -133,20 +162,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"报告: {res['report']}")
             return 0
 
-    if args.demo:
-        cfg.data.source = "synthetic"
-        # demo 与真实数据隔离，避免合成数据覆盖 data/processed
-        cfg.data.root = Path("artifacts/demo_data")
-        storage = Storage(cfg.data.root)
-        if not storage.has("prices") or args.force:
-            prepare_data(cfg)
-        bundle = storage.load_bundle()
-        res = run_research(cfg, bundle, args.output, force=args.force)
-        _print_summary(res)
-        return 0
-
     parser.print_help()
-    return 0
+    # 参数组合不匹配任何分支时返回非零：此前返回 0，
+    # 计划任务视角是"成功"，失败被静默吞掉
+    return 2
 
 
 if __name__ == "__main__":

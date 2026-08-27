@@ -21,6 +21,7 @@ class PaperBroker:
         prices: pd.DataFrame,
         initial_cash: float = 1_000_000.0,
         cost: CostModel | None = None,
+        avg_amount: "pd.Series | None" = None,
     ):
         self._close = prices.pivot(index="date", columns="symbol", values="close")
         self._cash = initial_cash
@@ -28,6 +29,9 @@ class PaperBroker:
         self._orders: list[Order] = []
         self._buy_dates: dict[str, str] = {}
         self._cost = cost or CostModel()
+        # 近 20 日均成交额（symbol 索引）：启用 adaptive 滑点时与回测同口径。
+        # 此前恒传 0，adaptive 配置被静默降级为固定 bp，纸面与回测口径分裂。
+        self._avg_amount = avg_amount if avg_amount is not None else pd.Series(dtype=float)
         self._total_fees = 0.0
         self.trade_date: str | None = None
 
@@ -56,9 +60,16 @@ class PaperBroker:
         return self._last_price(symbol)
 
     def portfolio_value(self) -> float:
-        return self._cash + sum(
-            p.shares * self._last_price(s) for s, p in self._positions.items() if p.shares > 0
-        )
+        total = self._cash
+        for s, p in self._positions.items():
+            if p.shares <= 0:
+                continue
+            px = self._last_price(s)
+            if px != px or px <= 0:
+                # 无价持仓不得毒化整体市值（NaN 会连锁污染权重与调仓金额）
+                continue
+            total += p.shares * px
+        return total
 
     def settle(self, as_of: str) -> None:
         """T+1 解锁：as_of 晚于买入日的持仓全部变为可卖。"""
@@ -75,7 +86,9 @@ class PaperBroker:
             order.reason = "no_price"
             self._orders.append(order)
             return order.id
-        slip_bp = self._cost.effective_slippage_bp(px * order.shares, 0.0)
+        slip_bp = self._cost.effective_slippage_bp(
+            px * order.shares, float(self._avg_amount.get(order.symbol, 0.0) or 0.0)
+        )
         if order.side == "buy":
             fill_px = px * (1 + slip_bp / 10_000)
             amount = fill_px * order.shares

@@ -20,6 +20,7 @@ def build_panels(bundle: DataBundle, cfg: Config) -> Panels:
     """从 DataBundle 构造宽表面板。"""
     prices = _attach_fundamentals(bundle.prices, bundle.fundamentals)
     prices = _attach_sentiment(prices, bundle.sentiment if hasattr(bundle, "sentiment") else None)
+    prices = _attach_cashflow(prices, getattr(bundle, "cashflow", None))
     prices = prices.sort_values(["date", "symbol"])
     # 排除仙股/极端离群值，避免污染逐日横截面的 winsorize/zscore/中性化统计量
     if cfg.data.universe.min_price > 0:
@@ -46,10 +47,12 @@ def build_panels(bundle: DataBundle, cfg: Config) -> Panels:
         if c.empty:
             consensus = None
         else:
-            # 仅保留最近年度、最近快照的一致预期（快照表列为 as_of_date，透视前统一为 date）
+            # 仅保留最近年度的一致预期。去重键必须是 (symbol, as_of_date)：
+            # 此前按 symbol 全历史保留最后一条快照，面板在其最终快照日前
+            # 全 NaN、之后恒定 → revision 因子静默退化为 0/NaN（死因子）
             c = (
                 c.sort_values(["symbol", "as_of_date", "year"])
-                .drop_duplicates("symbol", keep="last")
+                .drop_duplicates(["symbol", "as_of_date"], keep="last")
                 .rename(columns={"as_of_date": "date"})
             )
             consensus = _wide(c, "eps_mean") if "eps_mean" in c.columns else None
@@ -64,6 +67,9 @@ def build_panels(bundle: DataBundle, cfg: Config) -> Panels:
         roe=_wide(prices, "roe") if "roe" in prices.columns else pd.DataFrame(),
         gross_margin=_wide(prices, "gross_margin") if "gross_margin" in prices.columns else pd.DataFrame(),
         div_yield=_wide(prices, "div_yield") if "div_yield" in prices.columns else pd.DataFrame(),
+        eps=_wide(prices, "eps") if "eps" in prices.columns else pd.DataFrame(),
+        ocfps=_wide(prices, "ocfps") if "ocfps" in prices.columns else pd.DataFrame(),
+        ocf_ytd=_wide(prices, "ocf_ytd") if "ocf_ytd" in prices.columns else pd.DataFrame(),
         sentiment=sentiment,
         forecast=_wide(prices, "forecast_growth") if "forecast_growth" in prices.columns else pd.DataFrame(),
         industry=industry_map,
@@ -163,7 +169,54 @@ def _attach_fundamentals(prices: pd.DataFrame, fundamentals: pd.DataFrame) -> pd
             if col not in m.columns:
                 m[col] = 0.0
             else:
-                m[col] = m[col].fillna(0.0)
+                # 先按时间前向填充再补 0：财务表各列披露节奏不同（如股息率
+                # 只在年报行），若直接 fillna(0)，最新一行缺失该列会把上一
+                # 季报的有效值打穿成 0，严重压低质量/红利类因子覆盖度
+                m[col] = m[col].ffill().fillna(0.0)
+        parts.append(m)
+    return pd.concat(parts, ignore_index=True)
+
+
+def _attach_cashflow(prices: pd.DataFrame, cashflow: pd.DataFrame | None) -> pd.DataFrame:
+    """现金流数据按公告日 merge_asof 接入日线（点内时间，杜绝前视）。
+
+    无数据的股票取 0（中性占位）；同 _attach_fundamentals 的 ffill 语义。
+    """
+    cols = ("eps", "ocfps", "ocf_ytd")
+    if cashflow is None or cashflow.empty or "ocf_ytd" not in cashflow.columns:
+        prices = prices.copy()
+        for c in cols:
+            prices[c] = 0.0
+        return prices
+    f = cashflow.copy()
+    f["as_of_date"] = pd.to_datetime(f["as_of_date"]).astype("datetime64[ns]")
+    prices = prices.sort_values(["symbol", "date"]).copy()
+    prices["date"] = pd.to_datetime(prices["date"]).astype("datetime64[ns]")
+    parts: list[pd.DataFrame] = []
+    # 注意：右表不能带 symbol 列——与左表同名会在 merge_asof 中触发
+    # _x/_y 后缀，导致左表 symbol 被顶替成 NaN、面板坍缩
+    fg_cols = ["as_of_date"] + [c for c in cols if c in f.columns]
+    for sym, g in prices.groupby("symbol", sort=False):
+        fg = f[f["symbol"] == sym].sort_values("as_of_date")
+        if fg.empty:
+            g = g.copy()
+            for c in cols:
+                g[c] = 0.0
+            parts.append(g)
+            continue
+        m = pd.merge_asof(
+            g,
+            fg[fg_cols],
+            left_on="date",
+            right_on="as_of_date",
+            direction="backward",
+        )
+        m = m.drop(columns=["as_of_date"])
+        for c in cols:
+            if c not in m.columns:
+                m[c] = 0.0
+            else:
+                m[c] = m[c].ffill().fillna(0.0)
         parts.append(m)
     return pd.concat(parts, ignore_index=True)
 

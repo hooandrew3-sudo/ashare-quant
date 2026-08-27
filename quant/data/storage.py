@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -27,6 +29,8 @@ class DataBundle:
     forecast: pd.DataFrame = field(default_factory=pd.DataFrame)     # symbol, as_of_date, forecast_growth
     consensus: pd.DataFrame = field(default_factory=pd.DataFrame)    # symbol, as_of_date, year, n_institutions, eps_mean（分析师一致预期快照）
     smallcap: pd.DataFrame = field(default_factory=pd.DataFrame)     # date, close（中证1000 小盘基准）
+    constituents: pd.DataFrame = field(default_factory=pd.DataFrame) # snapshot_date, symbol（指数成分点内快照，消除幸存者偏差）
+    cashflow: pd.DataFrame = field(default_factory=pd.DataFrame)     # symbol, as_of_date, report_period, ocf_ytd, eps, ocfps（现金流因子源数据）
 
     def validate(self) -> None:
         if self.prices.empty:
@@ -53,14 +57,35 @@ class Storage:
     # ---- manifest ----
     def _load_manifest(self) -> dict:
         if self.manifest_path.exists():
-            with open(self.manifest_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+            try:
+                with open(self.manifest_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except json.JSONDecodeError:
+                # 写入中途崩溃会留下半截 JSON；回退 .bak，避免全库不可用
+                bak = self.manifest_path.with_suffix(".json.bak")
+                if bak.exists():
+                    import logging
+
+                    logging.getLogger("ashare.storage").warning(
+                        "manifest.json 损坏，已从 %s 回退", bak.name
+                    )
+                    with open(bak, "r", encoding="utf-8") as f:
+                        return json.load(f)
+                raise
         return {"datasets": {}, "updated_at": None}
 
     def save_manifest(self) -> None:
+        """原子写 manifest：先写临时文件再 os.replace，并保留上一版 .bak。
+
+        此前为截断式直接写：进程中途崩溃 → 半截 JSON → 下次启动全库不可用。
+        """
         self._manifest["updated_at"] = pd.Timestamp.now().isoformat()
-        with open(self.manifest_path, "w", encoding="utf-8") as f:
+        tmp = self.manifest_path.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(self._manifest, f, ensure_ascii=False, indent=2, default=str)
+        if self.manifest_path.exists():
+            shutil.copyfile(self.manifest_path, self.manifest_path.with_suffix(".json.bak"))
+        os.replace(tmp, self.manifest_path)
 
     def update_manifest(self, dataset: str, symbol: str, df: pd.DataFrame) -> None:
         entry = self._manifest["datasets"].setdefault(dataset, {})
@@ -75,11 +100,26 @@ class Storage:
         }
 
     # ---- io ----
-    def save(self, dataset: str, df: pd.DataFrame, partition_by_symbol: bool = True) -> None:
-        """写入 processed/{dataset}/，可选按 symbol 分区。"""
+    def save(
+        self,
+        dataset: str,
+        df: pd.DataFrame,
+        partition_by_symbol: bool = True,
+        allow_empty: bool = False,
+    ) -> None:
+        """写入 processed/{dataset}/，可选按 symbol 分区。
+
+        空表默认抛错：上游拉取失败返回空表时，静默早退会保留磁盘上的过期
+        数据，而调用方误以为已刷新。确认允许空表时显式传 allow_empty=True。
+        """
         target = ensure_dir(self.processed / dataset)
         if df.empty:
-            return
+            if allow_empty:
+                return
+            raise ValueError(
+                f"拒绝写入空数据集 {dataset}：上游可能拉取失败。"
+                "如确需写入空表请传 allow_empty=True"
+            )
         # pandas 3 可能产生 ms/s 精度 datetime，混合精度写入后 fastparquet 无法读取；
         # 统一转为 datetime64[ns]
         datetime_cols = df.select_dtypes(include=["datetime64"]).columns
@@ -88,11 +128,24 @@ class Storage:
             for col in datetime_cols:
                 df[col] = pd.to_datetime(df[col]).astype("datetime64[ns]")
         if partition_by_symbol and "symbol" in df.columns:
+            symbols: set[str] = set()
             for symbol, group in df.groupby("symbol", sort=False):
-                group.to_parquet(target / f"{symbol}.parquet", index=False)
+                fname = f"{symbol}.parquet"
+                group.to_parquet(target / fname, index=False)
                 self.update_manifest(dataset, symbol, group)
+                symbols.add(fname)
+            # 孤儿分区回收：universe 切换后旧 symbol 文件残留会被 load() 读入，
+            # 造成新旧股票池数据混合污染
+            for p in target.glob("*.parquet"):
+                if p.name not in symbols:
+                    p.unlink()
         else:
-            df.to_parquet(target / "all.parquet", index=False)
+            tmp = target / "all.parquet.tmp"
+            df.to_parquet(tmp, index=False)
+            final = target / "all.parquet"
+            if final.exists():
+                final.unlink()
+            os.replace(tmp, final)
             self.update_manifest(dataset, "*", df)
         self.save_manifest()
 
@@ -126,4 +179,6 @@ class Storage:
             forecast=self.load("forecast"),
             consensus=self.load("consensus"),
             smallcap=self.load("smallcap"),
+            constituents=self.load("constituents"),
+            cashflow=self.load("cashflow"),
         )

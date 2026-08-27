@@ -24,7 +24,12 @@ class FillSimulator:
     def __init__(self, prices: pd.DataFrame, cost: CostModel):
         self.cost = cost
         self._bars = prices.set_index(["date", "symbol"])
-        self._close = prices.pivot(index="date", columns="symbol", values="close").ffill()
+        close = prices.pivot(index="date", columns="symbol", values="close").ffill().sort_index()
+        self._close = close
+        # 预计算 numpy 矩阵 + 列索引，last_close 由 O(N) 布尔扫描降为 O(log D)
+        self._close_index = close.index
+        self._close_values = close.to_numpy(dtype=float)
+        self._col_of: dict[str, int] = {s: i for i, s in enumerate(close.columns)}
 
     def try_fill(
         self,
@@ -75,11 +80,15 @@ class FillSimulator:
             return FillResult(status="filled", price=px, shares=shares, fee=fee)
 
     def last_close(self, symbol: str, date: pd.Timestamp) -> float:
-        series = self._close[symbol] if symbol in self._close.columns else pd.Series(dtype=float)
-        hist = series[series.index <= date]
-        if hist.empty:
+        """date 当日（或此前最近）的复权收盘价；预计算矩阵上二分查找。"""
+        col = self._col_of.get(symbol)
+        if col is None:
             return float("nan")
-        return float(hist.iloc[-1])
+        pos = self._close_index.searchsorted(date, side="right")
+        if pos <= 0:
+            return float("nan")
+        v = self._close_values[pos - 1, col]
+        return float(v) if v == v else float("nan")
 
 
 def _flag(bar, key: str) -> bool | None:

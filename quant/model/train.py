@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from quant.config import Config
+from quant.config import Config, ModelConfig
 from quant.utils import setup_logging
 
 
@@ -44,9 +44,10 @@ def _make_model(cfg: Config, seed: int | None = None):
             if is_reg:
                 from lightgbm import LGBMRegressor
 
-                return LGBMRegressor(
-                    random_state=seed, verbosity=-1, **cfg.model.params
-                )
+                params = dict(cfg.model.params)
+                params.setdefault("random_state", seed)
+                params.setdefault("verbosity", -1)
+                return LGBMRegressor(**params)
             from lightgbm import LGBMClassifier
 
             params = dict(cfg.model.params)
@@ -77,20 +78,29 @@ def _metric(features: np.ndarray, y: np.ndarray) -> dict:
     return {"auc": float(auc), "n_pos": int(len(pos)), "n_neg": int(len(neg))}
 
 
+def _max_horizon(cfg: ModelConfig) -> int:
+    """标签视野上限：purge/embargo 长度取多周期配置的最大 horizon。"""
+    horizons = list(getattr(cfg, "horizons", None) or [getattr(cfg, "horizon", 20)])
+    return max(int(h) for h in horizons if h and int(h) > 0)
+
+
 def _make_windows(
-    dates: pd.DatetimeIndex, cfg: Config
+    dates: pd.DatetimeIndex, cfg: ModelConfig
 ) -> list[tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp, int]]:
     """滚动窗口：返回 [(train_start, train_end, test_start, test_end, fold)]。
 
     约束：train_end < test_start；窗口从数据末端向前滚动。
+    purge：训练窗末端回退 max_horizon 个交易日 —— horizon=N 的重叠标签
+    会使训练集尾部样本的收益窗口延伸进测试期，构成边界泄漏（embargo）。
     """
-    test_days = cfg.model.test_months * 21
-    train_days = cfg.model.train_years * 252
+    test_days = cfg.test_months * 21
+    train_days = cfg.train_years * 252
+    embargo = _max_horizon(cfg)
     windows = []
     test_end = dates[-1]
-    for fold in range(cfg.model.n_splits):
+    for fold in range(cfg.n_splits):
         test_start_idx = max(0, dates.searchsorted(test_end) - test_days)
-        train_end_idx = test_start_idx - 1
+        train_end_idx = test_start_idx - 1 - embargo
         train_start_idx = max(0, train_end_idx - train_days + 1)
         if test_start_idx <= 0 or train_end_idx <= 0 or test_start_idx >= len(dates) - 1:
             break
@@ -107,6 +117,23 @@ def _make_windows(
     return windows
 
 
+def oos_region_start(dates: pd.DatetimeIndex, cfg: ModelConfig) -> pd.Timestamp | None:
+    """全部 Walk-Forward 折覆盖的 OOS 区间起点（最早一折 test_start 回退 horizon）。
+
+    因子准入 / 复合因子权重 / 门禁 t 值的数据窗口必须 ≤ 该日期，否则
+    特征构造用到了 OOS 测试段自身的未来收益（结构性前视）。回退一个
+    horizon 是因为 date≤D 的标签收益延伸至 D+horizon，须保证不越过
+    最早的测试日。
+    """
+    windows = _make_windows(pd.DatetimeIndex(sorted(dates)), cfg)
+    if not windows:
+        return None
+    earliest_test_start = min(pd.Timestamp(w[2]) for w in windows)
+    idx = pd.DatetimeIndex(sorted(dates)).searchsorted(earliest_test_start)
+    clean_idx = max(0, idx - _max_horizon(cfg))
+    return pd.DatetimeIndex(sorted(dates))[clean_idx]
+
+
 def walk_forward(
     xy: pd.DataFrame,
     cfg: Config,
@@ -117,7 +144,7 @@ def walk_forward(
     """执行 Walk-Forward，返回 OOS 预测、逐折指标、最终模型。"""
     log = log or setup_logging(cfg.run.verbose)
     dates = pd.DatetimeIndex(sorted(xy["date"].unique()))
-    windows = _make_windows(dates, cfg)
+    windows = _make_windows(dates, cfg.model)
     if not windows:
         raise RuntimeError("数据时间跨度不足以构成 Walk-Forward 窗口，请扩大数据范围")
 
@@ -147,7 +174,7 @@ def walk_forward(
         else:
             proba = model.predict_proba(X_all[test_mask])[:, 1]
             m = _metric(proba, y_all[test_mask])
-        ic = _rank_ic(proba, excess_all[test_mask])
+        ic = _daily_rank_ic(date_arr[test_mask], proba, excess_all[test_mask])
         fold_metrics.append(
             {
                 "fold": fold,
@@ -197,6 +224,28 @@ def _rank_ic(score: np.ndarray, excess: np.ndarray) -> float:
     s = pd.Series(score[mask]).rank()
     e = pd.Series(excess[mask]).rank()
     return float(s.corr(e))
+
+
+def _daily_rank_ic(dates: np.ndarray, score: np.ndarray, excess: np.ndarray) -> float:
+    """逐日截面 Rank IC 的均值（业界标准口径）。
+
+    此前实现把整折所有 (date, symbol) 混入单一 Spearman，混合了截面与时序
+    变异，与其他模块的“逐日 IC 均值”不可比，且可能掩盖符号翻转。
+    """
+    df = pd.DataFrame({"date": dates, "score": score, "excess": excess})
+    df = df.dropna(subset=["excess"])
+    if df.empty:
+        return float("nan")
+    ics = []
+    for _, g in df.groupby("date"):
+        if len(g) < 10:
+            continue
+        ic = g["score"].rank().corr(g["excess"].rank())
+        if ic == ic:
+            ics.append(ic)
+    if not ics:
+        return float("nan")
+    return float(np.mean(ics))
 
 
 def ensemble_scores(oos_by_horizon: dict[int, pd.DataFrame]) -> pd.DataFrame:

@@ -24,6 +24,9 @@ class Panels:
         forecast: pd.DataFrame | None = None,
         industry: pd.Series | None = None,
         consensus: pd.DataFrame | None = None,
+        eps: pd.DataFrame | None = None,
+        ocfps: pd.DataFrame | None = None,
+        ocf_ytd: pd.DataFrame | None = None,
     ):
         self.close = close
         self.volume = volume
@@ -38,6 +41,9 @@ class Panels:
         self.forecast = forecast
         self.industry = industry
         self.consensus = consensus
+        self.eps = eps if eps is not None else pd.DataFrame()
+        self.ocfps = ocfps if ocfps is not None else pd.DataFrame()
+        self.ocf_ytd = ocf_ytd if ocf_ytd is not None else pd.DataFrame()
 
     def get(self, name: str) -> pd.DataFrame:
         return getattr(self, name)
@@ -164,6 +170,64 @@ def _f_size_proxy(p: Panels) -> pd.DataFrame:
     return -np.log(amt + 1.0)
 
 
+def _f_earn_mom(p: Panels) -> pd.DataFrame:
+    """盈利改善：ROE 同比变化（当期 − 一年前）。
+
+    盈利质量趋势类信号：ROE 持续改善的公司盈余质量更高。面板已按公告日
+    merge_asof + ffill 点内接入，shift(252) 对齐去年同期（A 股 ROE 为
+    YTD 累计口径，同比才可比，环比会混入季节长度差异）。
+    覆盖不足的股票走截面中位数填充路径。
+    """
+    if p.roe is None or p.roe.empty:
+        return pd.DataFrame(0.0, index=p.close.index, columns=p.close.columns)
+    return p.roe - p.roe.shift(252)
+
+
+def _f_gm_mom(p: Panels) -> pd.DataFrame:
+    """毛利率同比改善：盈利质量的第二观测维度（与 earn_mom 相关性由准入去重控制）。"""
+    if p.gross_margin is None or p.gross_margin.empty:
+        return pd.DataFrame(0.0, index=p.close.index, columns=p.close.columns)
+    return p.gross_margin - p.gross_margin.shift(252)
+
+
+def _f_ep_chg(p: Panels) -> pd.DataFrame:
+    """盈利收益率动量：ΔEP = 1/PE 的 63 日变化（全市场日频覆盖）。
+
+    现金流报表数据尚未接入（审计 v8 §9 遗留），此因子以日频 PE 反推
+    盈利预期变化：EP 提升来自盈利上修或估值回落，行业中性化后主要保留
+    盈利改善成分。与 valuation 静态口径互补。
+    """
+    ep = 1.0 / p.pe.replace(0, np.nan)
+    return ep - ep.shift(63)
+
+
+def _f_earn_quality(p: Panels) -> pd.DataFrame:
+    """盈利含金量：每股经营现金流 / |每股收益|（Sloan 应计的反向表述）。
+
+    >1 表示利润有真金白银支撑；应计占比高（<1，靠应收/存货堆出来的利润）
+    的公司未来收益质量差。分母加 0.01 元下限保护微利/亏损股；
+    无现金流数据时为 0（中性），覆盖度由准入与哨兵观测。
+    """
+    if p.ocfps is None or p.ocfps.empty or p.eps is None or p.eps.empty:
+        return pd.DataFrame(0.0, index=p.close.index, columns=p.close.columns)
+    eps_safe = p.eps.where(p.eps.abs() >= 0.01)
+    ratio = p.ocfps / eps_safe
+    return ratio.replace([np.inf, -np.inf], np.nan)
+
+
+def _f_ocf_growth(p: Panels) -> pd.DataFrame:
+    """经营现金流同比增长：OCF_YTD / OCF_YTD(-252交易日) − 1。
+
+    YTD 对同期同比，规避季报累计口径的季节性；基期为 0/缺失时保持 NaN
+    （避免虚假高增长），走截面中位数填充路径。
+    """
+    if p.ocf_ytd is None or p.ocf_ytd.empty:
+        return pd.DataFrame(0.0, index=p.close.index, columns=p.close.columns)
+    base = p.ocf_ytd.shift(252)
+    growth = p.ocf_ytd / base.where(base.abs() > 1e-6) - 1.0
+    return growth.replace([np.inf, -np.inf], np.nan)
+
+
 FACTOR_SPECS: dict[str, dict] = {
     "mom_12_1": {"category": "momentum", "direction": +1, "horizon": 20, "compute": _f_mom_12_1},
     "rev_5": {"category": "reversal", "direction": +1, "horizon": 5, "compute": _f_rev_5},
@@ -180,6 +244,12 @@ FACTOR_SPECS: dict[str, dict] = {
     "low_vol": {"category": "defensive", "direction": +1, "horizon": 20, "compute": _f_low_vol},
     "div_yield": {"category": "defensive", "direction": +1, "horizon": 20, "compute": _f_div_yield},
     "quality": {"category": "defensive", "direction": +1, "horizon": 20, "compute": _f_quality},
+    "earn_mom": {"category": "quality_trend", "direction": +1, "horizon": 20, "compute": _f_earn_mom},
+    "gm_mom": {"category": "quality_trend", "direction": +1, "horizon": 20, "compute": _f_gm_mom},
+    "ep_chg": {"category": "quality_trend", "direction": +1, "horizon": 20, "compute": _f_ep_chg},
+    # 现金流质量族（数据：cashflow 数据集，--step cashflow 拉取）
+    "earn_quality": {"category": "cashflow_quality", "direction": +1, "horizon": 20, "compute": _f_earn_quality},
+    "ocf_growth": {"category": "cashflow_quality", "direction": +1, "horizon": 20, "compute": _f_ocf_growth},
     "crowding": {"category": "defensive", "direction": +1, "horizon": 20, "compute": _f_crowding},
     "illiquidity": {"category": "liquidity", "direction": +1, "horizon": 20, "compute": _f_illiquidity},
     "max_ret": {"category": "behavioral", "direction": +1, "horizon": 20, "compute": _f_max_ret},

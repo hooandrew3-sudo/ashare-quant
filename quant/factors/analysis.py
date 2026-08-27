@@ -24,6 +24,29 @@ def _rank_ic_series(factor_wide: pd.DataFrame, label_wide: pd.DataFrame) -> pd.S
     return ic.dropna()
 
 
+def _nw_t_stat(ic: pd.Series, lag: int) -> float:
+    """Newey-West (Bartlett 核) t 统计量。
+
+    horizon=N 的重叠标签使逐日 IC 序列存在 N-1 阶自相关，朴素
+    mean/(std/sqrt(n)) 会把 t 膨胀约 sqrt(N) 倍，导致显著性门槛失效。
+    lag 取标签 horizon（默认 20）可正确校正长期自相关。
+    """
+    x = pd.Series(ic).dropna().to_numpy(dtype=float)
+    n = len(x)
+    if n < 3:
+        return float("nan")
+    lag = max(0, min(int(lag), n - 2))
+    u = x - x.mean()
+    s2 = float(np.dot(u, u))
+    for k in range(1, lag + 1):
+        w = 1.0 - k / (lag + 1.0)
+        s2 += 2.0 * w * float(np.dot(u[k:], u[:-k]))
+    se = np.sqrt(max(s2, 0.0) / n / n)
+    if se <= 0 or not np.isfinite(se):
+        return float("nan")
+    return float(x.mean() / se)
+
+
 def _quantile_returns(factor_wide: pd.DataFrame, label_wide: pd.DataFrame, n: int = 5) -> pd.DataFrame:
     """分位数平均未来超额收益（日期 × 分位）。"""
     label = label_wide.reindex(index=factor_wide.index, columns=factor_wide.columns)
@@ -52,6 +75,7 @@ def factor_ic_report(
     if date_range is not None:
         start, end = date_range
         label_wide = label_wide.loc[start:end]
+    nw_lag = int(getattr(getattr(cfg, "factors", None), "ic_nw_lag", 20) or 20)
     results = {}
     for name, group in factor_long.groupby("factor", sort=False):
         f_wide = group.pivot(index="date", columns="symbol", values="value")
@@ -62,14 +86,19 @@ def factor_ic_report(
             continue
         spec = FACTOR_SPECS.get(name)
         direction = factor_direction(name) if spec else 1
-        f_wide = group.pivot(index="date", columns="symbol", values="value")
         ic = _rank_ic_series(f_wide, label_wide)
         # 方向统一：direction<0 的因子，IC 取反后再看显著性
         ic_adj = ic * direction
         ic_mean = float(ic_adj.mean()) if len(ic_adj) else np.nan
         ic_std = float(ic_adj.std()) if len(ic_adj) else np.nan
         icir = ic_mean / ic_std if ic_std and ic_std > 0 else np.nan
-        t_stat = ic_mean / (ic_std / np.sqrt(len(ic_adj))) if ic_std and len(ic_adj) > 1 else np.nan
+        # t 统计量：Newey-West 校正重叠标签自相关（朴素 t 见 t_stat_naive，仅存档对比）
+        t_stat = _nw_t_stat(ic_adj, lag=nw_lag)
+        t_naive = (
+            ic_mean / (ic_std / np.sqrt(len(ic_adj)))
+            if ic_std and len(ic_adj) > 1
+            else np.nan
+        )
         qret = _quantile_returns(f_wide, label_wide)
         monotonic = float(qret.iloc[:, -1].mean() - qret.iloc[:, 0].mean()) if len(qret) else np.nan
         decay = {}
@@ -92,6 +121,7 @@ def factor_ic_report(
             "rank_ic_std": round(ic_std, 5) if ic_std == ic_std else None,
             "icir": round(icir, 4) if icir == icir else None,
             "t_stat": round(t_stat, 3) if t_stat == t_stat else None,
+            "t_stat_naive": round(t_naive, 3) if t_naive == t_naive else None,
             "n_days": int(len(ic_adj)),
             "q1_mean": float(qret.iloc[:, 0].mean()) if len(qret) else np.nan,
             "q5_mean": float(qret.iloc[:, -1].mean()) if len(qret) else np.nan,

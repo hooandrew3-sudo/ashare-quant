@@ -1,0 +1,50 @@
+# 长周期多 regime 对照：real 策略参数 + 全窗口 2018-01-01→2026-08-20
+# factors/model/portfolio 全部保持 real 原值（strategy_fingerprint 应 == 797ba5f8960f）
+data:
+  source: parquet
+  root: data
+  benchmark: "000906.SH"
+  sync:
+    universe: csi800
+    start: "2021-01-01"
+    end: ""
+    incremental: true
+
+factors:
+  composite_weight: t          # 同类对照结论：t 加权 + 无衰减约束优于 icir+衰减约束
+  composite_require_decay: false
+
+model:
+  name: auto
+  n_splits: 5
+  horizons: [5, 10, 20, 40]
+  n_seeds: 3
+  label_mode: binary
+  params:
+    n_estimators: 250
+    learning_rate: 0.05
+    num_leaves: 31
+    min_child_samples: 30
+    subsample: 0.8
+    colsample_bytree: 0.8
+
+portfolio:
+  top_n: 30
+  target_vol: 0.10
+  stickiness: 0.90
+  band: 0.15
+  exposure_step: 0.25
+  turnover_cap: 0.30
+  min_overlap: 0.85
+  rebalance_freq: Q
+  beta_target: 0.5
+  beta_window: 60
+  beta_scale_max: 1.0   # 试验结论：放大 beta 拖累 IR/回撤，默认禁用
+
+backtest:
+  start: "2018-01-01"
+  end: "2026-08-20"
+  initial_cash: 1000000
+
+report:
+  title: "A股多因子概率决策系统 · 长周期多 regime 对照（real 策略 2018-2026）"

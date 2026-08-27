@@ -89,9 +89,16 @@ def prepare_data(cfg: Config, symbols: list[str] | None = None) -> DataBundle:
     bundle.validate()
     storage.save("prices", bundle.prices)
     storage.save("benchmark", bundle.benchmark, partition_by_symbol=False)
-    storage.save("meta", bundle.meta, partition_by_symbol=False)
-    storage.save("industry", bundle.industry, partition_by_symbol=False)
-    storage.save("fundamentals", bundle.fundamentals, partition_by_symbol=False)
+    # 可选数据集：为空时显式放行并告警（此前静默早退，磁盘残留过期数据无人知晓）
+    for name, part_df in (
+        ("meta", bundle.meta),
+        ("industry", bundle.industry),
+        ("fundamentals", bundle.fundamentals),
+        ("constituents", getattr(bundle, "constituents", pd.DataFrame())),
+    ):
+        if part_df.empty:
+            log.warning("数据集 %s 为空（上游未提供或拉取失败），保留存储现状", name)
+        storage.save(name, part_df, partition_by_symbol=False, allow_empty=True)
     log.info("数据已写入 %s（%d 行 prices）", storage.processed, len(bundle.prices))
     return bundle
 
@@ -108,6 +115,23 @@ def prepare_fundamentals(cfg: Config) -> pd.DataFrame:
     storage.save("fundamentals", fund, partition_by_symbol=False)
     log.info("财务数据已写入: %d 条 (symbol=%d)", len(fund), fund["symbol"].nunique())
     return fund
+
+
+def prepare_cashflow(cfg: Config) -> pd.DataFrame:
+    """拉取全市场季度现金流（OCF/每股收益/每股经营现金流）并写入 cashflow.parquet。"""
+    log = setup_logging(cfg.run.verbose)
+    from quant.data.fundamentals_ak import fetch_cashflow
+
+    cf = fetch_cashflow(verbose=cfg.run.verbose)
+    if cf.empty:
+        raise RuntimeError("现金流数据拉取为空")
+    storage = Storage(cfg.data.root)
+    storage.save("cashflow", cf, partition_by_symbol=False)
+    log.info(
+        "现金流数据已写入: %d 条 (symbol=%d, 期数=%d)",
+        len(cf), cf["symbol"].nunique(), cf["report_period"].nunique(),
+    )
+    return cf
 
 
 def prepare_industry(cfg: Config) -> pd.DataFrame:
@@ -200,22 +224,73 @@ def run_research(
 
     # 3. 标签 + IC 报告（完整报告用于研究归档）
     label_long = build_label(bundle.prices, bundle.benchmark, cfg)
-    # P0 防泄露：提前计算 in-sample cutoff（供 composite 和因子筛选共用）
-    all_dates = pd.to_datetime(factor_long["date"]).sort_values().unique()
-    train_cutoff = None
-    if len(all_dates) > 252:
-        cutoff_idx = int(len(all_dates) * 0.6)
-        train_cutoff = pd.Timestamp(all_dates[cutoff_idx])
+    # P0 防泄露：in-sample cutoff 必须对齐 Walk-Forward OOS 区间起点。
+    # 此前按"全样本前 60%"取 cutoff，当样本 < ~6.3 年时 cutoff 会落在
+    # 首折测试段之内 —— 复合因子权重/因子准入用到了测试段自身的未来收益，
+    # 属结构性前视。现改为直接复用 _make_windows 的折边界（再回退一个 horizon）。
+    from quant.model.train import oos_region_start
+
+    all_dates = pd.DatetimeIndex(sorted(pd.unique(pd.to_datetime(factor_long["date"]))))
+    train_cutoff = oos_region_start(all_dates, cfg.model)
+    if train_cutoff is not None:
+        log.info(
+            "因子准入/复合因子窗口 cutoff: %s（= 最早一折 test_start 回退 horizon，杜绝 OOS 泄漏）",
+            pd.Timestamp(train_cutoff).date(),
+        )
+    else:
+        # 无有效 Walk-Forward 窗口时退回 60% 规则并显式告警
+        if len(all_dates) > 252:
+            train_cutoff = pd.Timestamp(all_dates[int(len(all_dates) * 0.6)])
+            log.warning("无法推导 OOS 起点，cutoff 退回 60%% 规则: %s", train_cutoff.date())
     ic_report = factor_ic_report(factor_long, label_long, cfg)
     # 3.1 复合因子：方向显著因子等权合成，再纳入 IC 报告与特征
     if cfg.factors.composite:
         from quant.factors.composite import build_composite_factor
 
         ic_report_for_composite = ic_report
+        rotate = bool(getattr(cfg.factors, "composite_regime_rotate", False))
+        regime_ctx = None
         if train_cutoff is not None:
             f_in = factor_long[pd.to_datetime(factor_long["date"]) <= train_cutoff]
             l_in = label_long[pd.to_datetime(label_long["date"]) <= train_cutoff]
             ic_report_for_composite = factor_ic_report(f_in, l_in, cfg)
+        if rotate and not bundle.benchmark.empty:
+            # 牛熊分域：基准收盘 vs MA(composite_regime_ma)，仅用 ≤cutoff 样本估计
+            bench_close = bundle.benchmark.set_index("date")["close"].sort_index()
+            ma = bench_close.rolling(
+                int(getattr(cfg.factors, "composite_regime_ma", 120)), min_periods=60
+            ).mean()
+            bull_all = (bench_close > ma).dropna()
+            bull_dates = {pd.Timestamp(d) for d in bull_all[bull_all].index}
+            if train_cutoff is not None:
+                bull_dates = {
+                    d for d in bull_dates if d <= pd.Timestamp(train_cutoff)
+                }
+            d_in = f_in if train_cutoff is not None else factor_long
+            dl_in = l_in if train_cutoff is not None else label_long
+            din_date = pd.to_datetime(d_in["date"])
+            f_bull = d_in[din_date.isin(pd.to_datetime(sorted(bull_dates)))]
+            l_bull = dl_in[pd.to_datetime(dl_in["date"]).isin(pd.to_datetime(sorted(bull_dates)))]
+            f_bear = d_in[~din_date.isin(pd.to_datetime(sorted(bull_dates)))]
+            l_bear = dl_in[~pd.to_datetime(dl_in["date"]).isin(pd.to_datetime(sorted(bull_dates)))]
+            ic_bull = (
+                factor_ic_report(f_bull, l_bull, cfg)
+                if len(f_bull) and len(l_bull)
+                else None
+            )
+            ic_bear = (
+                factor_ic_report(f_bear, l_bear, cfg)
+                if len(f_bear) and len(l_bear)
+                else None
+            )
+            regime_ctx = (bull_dates, ic_bull, ic_bear)
+            n_in_dates = int(pd.to_datetime(d_in["date"]).nunique())
+            log.info(
+                "复合因子 regime 轮动启用：牛市日 %d / 熊市日 %d（估计窗口 ≤%s）",
+                len(bull_dates),
+                n_in_dates - len([d for d in pd.to_datetime(d_in['date'].unique()) if pd.Timestamp(d) in bull_dates]),
+                pd.Timestamp(train_cutoff).date() if train_cutoff is not None else "全样本",
+            )
         composite = build_composite_factor(
             factor_long,
             ic_report_for_composite,
@@ -224,6 +299,9 @@ def run_research(
             corr_max=cfg.factors.composite_corr_max,
             require_stable_decay=cfg.factors.composite_require_decay,
             weight_by=cfg.factors.composite_weight,
+            regime_bull_dates=regime_ctx[0] if regime_ctx else None,
+            ic_report_bull=regime_ctx[1] if regime_ctx else None,
+            ic_report_bear=regime_ctx[2] if regime_ctx else None,
         )
         if not composite.empty:
             factor_long = pd.concat([factor_long, composite], ignore_index=True)
@@ -238,12 +316,8 @@ def run_research(
     ic_frame.to_csv(art / "ic_report.csv", index=False)
 
     # 4. 因子准入（P0 防泄露：使用样本内前期数据做因子筛选，禁用全量 IC 窥探测试集）
-    all_dates = pd.to_datetime(factor_long["date"]).sort_values().unique()
-    train_cutoff = None
-    if len(all_dates) > 252:
-        cutoff_idx = int(len(all_dates) * 0.6)
-        train_cutoff = pd.Timestamp(all_dates[cutoff_idx])
-        log.info("因子准入筛选 cutoff: %s（保留前 %.0f%% 时间）", train_cutoff.date(), 60)
+    # train_cutoff 已在步骤 3 按 OOS 区间起点推导，此处直接复用（勿重复计算导致口径漂移）
+    if train_cutoff is not None:
         f_in = factor_long[pd.to_datetime(factor_long["date"]) <= train_cutoff]
         l_in = label_long[pd.to_datetime(label_long["date"]) <= train_cutoff]
         ic_report_in = factor_ic_report(f_in, l_in, cfg)
@@ -252,19 +326,24 @@ def run_research(
             key=lambda kv: abs(kv[1]["rank_ic_mean"] or 0), reverse=True,
         )
         passed = ic_report_in["passed"]
+        if not passed:
+            log.warning("样本内窗口无因子通过准入（NW 校正后 t 值更严格），将按 |IC| 排序补齐特征")
     else:
         ranked_in = sorted(
             ic_report["factors"].items(),
             key=lambda kv: abs(kv[1]["rank_ic_mean"] or 0), reverse=True,
         )
         passed = ic_report["passed"]
-    # 准入因子 + 复合因子（如已生成）强制入特征，再按 |IC| 补齐 ≥3 个
+    # 准入因子 + 复合因子（如已生成）强制入特征，再按 |IC| 补齐 ≥3 个。
+    # 实验（v9 §10）：补满 top_n 会稀释模型（8.9% vs 12.4%/13.6%）——
+    # 弱特征（如 earn_mom 负 IC）进入反而拖累 LightGBM；
+    # 复合因子成员资格由准入严格把关，特征槽位维持最小补齐。
     selected = list(passed)
     if cfg.factors.composite and "composite" in set(factor_long["factor"].unique()):
         if "composite" not in selected:
             selected.append("composite")
     min_features = max(3, len(selected))
-    ranked_source = ranked_in if train_cutoff is not None else ranked_in
+    ranked_source = ranked_in
     selected = selected + [
         n for n, _ in ranked_source if n not in selected
     ][: max(0, min_features - len(selected))]
@@ -321,7 +400,9 @@ def run_research(
         if n_folds >= 2 and len(oos_flat) >= 200 and oos_flat["y_true"].nunique() >= 2:
             calibrated = pd.Series(index=oos_flat.index, dtype=float)
             for f in fold_ids:
-                train_idx = oos_flat["fold"] != f
+                # expanding 校准：折 k 仅用时间上更早的折 <k 拟合，
+                # 禁止"未来折"信息回流（此前 fold != f 会用到更晚期间的结果）
+                train_idx = oos_flat["fold"] < f
                 val_idx = oos_flat["fold"] == f
                 if train_idx.sum() < 100 or val_idx.sum() < 30:
                     calibrated.loc[val_idx] = oos_flat.loc[val_idx, "score"]
@@ -372,8 +453,36 @@ def run_research(
         "calibrator": _final_cal,
     }
     _comp_meta = (ic_report.get("factors") or {}).get("composite", {}) if isinstance(ic_report, dict) else {}
-    result["composite_t"] = _comp_meta.get("t_stat")
-    result["composite_rank_ic"] = _comp_meta.get("rank_ic_mean")
+    # P0 门禁口径修正：composite_t 此前取自全样本 IC 报告（含全部 WF 测试段，
+    # "用考试答案决定能否参加考试"）。现改用纯 OOS 区间（≥ 最早一折 test_start）
+    # 重算复合因子 IC，t 值经 Newey-West 校正，作为上线门禁的真实判据。
+    oos_comp_meta: dict = {}
+    try:
+        first_test_start = None
+        fm_all = fold_metrics
+        if not fm_all.empty and "test_start" in fm_all.columns:
+            ts = pd.to_datetime(fm_all["test_start"]).min()
+            first_test_start = pd.Timestamp(ts)
+        if first_test_start is not None and "composite" in set(factor_long["factor"].unique()):
+            comp_long = factor_long[
+                (factor_long["factor"] == "composite")
+                & (pd.to_datetime(factor_long["date"]) >= first_test_start)
+            ]
+            label_oos = label_long[pd.to_datetime(label_long["date"]) >= first_test_start]
+            ic_oos = factor_ic_report(comp_long, label_oos, cfg)
+            oos_comp_meta = (ic_oos.get("factors") or {}).get("composite", {}) or {}
+            log.info(
+                "复合因子 OOS t=%.2f（全样本 t=%s，门禁采用 OOS 口径）",
+                oos_comp_meta.get("t_stat") if oos_comp_meta.get("t_stat") is not None else float("nan"),
+                _comp_meta.get("t_stat"),
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("OOS composite_t 计算失败，回退全样本口径: %s", exc)
+    result["composite_t"] = oos_comp_meta.get("t_stat", _comp_meta.get("t_stat"))
+    result["composite_rank_ic"] = oos_comp_meta.get(
+        "rank_ic_mean", _comp_meta.get("rank_ic_mean")
+    )
+    result["composite_t_full_sample"] = _comp_meta.get("t_stat")
     registry = ModelRegistry(Path(output_root))
     data_fingerprint = pd.util.hash_pandas_object(bundle.prices).sum()
     run_id_model = registry.save_run(cfg, str(data_fingerprint), result, run_id=run_id)
@@ -403,6 +512,7 @@ def run_research(
             industry=bundle.industry,
             cfg=cfg.portfolio,
             rebalance_dates=rebalance_dates,
+            constituents=getattr(bundle, "constituents", None),
         )
         if cfg.portfolio.weight_method == "risk_budget"
         else build_target_weights(
@@ -411,6 +521,7 @@ def run_research(
             industry=bundle.industry,
             cfg=cfg.portfolio,
             rebalance_dates=rebalance_dates,
+            constituents=getattr(bundle, "constituents", None),
         )
     )
     log.info("组合方法: %s", cfg.portfolio.weight_method)
@@ -543,29 +654,40 @@ def live_signals(cfg: Config, output_root: str | Path = "artifacts") -> pd.DataF
     )
     if not runs:
         raise RuntimeError("无已训练模型，请先运行 --step model")
-    latest = registry.load_run(runs[-1])
-    meta = latest.get("meta") or {}
-    sfp = meta.get("strategy_fingerprint")
-    if sfp:
-        if sfp != cfg.strategy_fingerprint():
-            raise RuntimeError(
-                f"模型 {runs[-1]} 的策略指纹与当前配置不一致（{sfp} vs "
-                f"{cfg.strategy_fingerprint()}）。因子/模型/组合参数已变更，"
-                "请按当前配置重新训练后再出信号。"
-            )
-    else:
-        # 旧版本产物无 strategy_fingerprint：降级为告警而非阻断，
-        # 避免每日任务因历史模型归档缺失而中断；强烈建议重训以启用严格门禁。
-        log.warning(
-            "模型 %s 缺少 strategy_fingerprint（旧版本产物），跳过严格策略指纹校验；"
-            "建议用当前配置重训一次以启用门禁",
-            runs[-1],
+    sfp = cfg.strategy_fingerprint()
+    latest = None
+    mismatched: list[str] = []
+    # 新 → 旧扫描：取第一个策略指纹与当前配置一致的完整模型。
+    # 此前固定取 sorted[-1] 再硬失败——重训产物若写到其他 output_root，
+    # 每日任务会拿到陈旧模型并整体失败（2026-08-26 事故根因）。
+    for run_name in reversed(runs):
+        meta_cand = registry.load_run(run_name).get("meta") or {}
+        cand_sfp = meta_cand.get("strategy_fingerprint")
+        if not cand_sfp:
+            log.warning("模型 %s 缺少 strategy_fingerprint（旧产物），跳过", run_name)
+            mismatched.append(run_name)
+            continue
+        if cand_sfp == sfp:
+            latest = registry.load_run(run_name)
+            meta = meta_cand
+            if run_name != runs[-1]:
+                log.warning(
+                    "最新模型 %s 指纹不匹配已跳过，回退使用 %s（建议尽快用当前配置重训到同一 output_root）",
+                    runs[-1], run_name,
+                )
+            break
+        mismatched.append(run_name)
+    if latest is None:
+        raise RuntimeError(
+            f"无策略指纹匹配的可用模型：{len(mismatched)} 个候选全部不一致"
+            f"（期望 {sfp}）。请用当前配置执行 --step model 重训后再出信号。"
         )
     # 模型上线门禁：OOS 质量阈值（默认复合因子 t≥5），不达标按配置告警或硬失败
     from quant.model.gate import evaluate_model_gate
 
     gate = evaluate_model_gate(cfg, meta)
-    gate["model"] = runs[-1]
+    model_run_id = meta.get("run_id", "?")
+    gate["model"] = model_run_id
     latest_date_gate = pd.Timestamp(bundle.prices["date"].max())
     sig_dir = ensure_dir(Path(output_root) / "signals")
     (sig_dir / f"gate_{latest_date_gate.date()}.json").write_text(
@@ -576,13 +698,13 @@ def live_signals(cfg: Config, output_root: str | Path = "artifacts") -> pd.DataF
         detail = ", ".join(gate["failed_checks"])
         if cfg.model.gate_block_on_fail:
             raise RuntimeError(
-                f"模型上线门禁未通过（{detail}）：模型 {runs[-1]} 不满足当前配置阈值，"
+                f"模型上线门禁未通过（{detail}）：模型 {model_run_id} 不满足当前配置阈值，"
                 "禁止出信号。请按当前配置重训，或调整 model.gate_* 阈值。"
             )
         log.warning("模型上线门禁未通过（%s），当前为告警模式，继续出信号", detail)
     models = latest.get("models") or {}
     if not models and latest.get("model") is None:
-        raise RuntimeError(f"模型 {runs[-1]} 缺少 model.joblib")
+        raise RuntimeError(f"模型 {model_run_id} 缺少 model.joblib")
     feature_cols = meta.get("feature_cols", [])
 
     factor_long, cov = compute_all_factors(bundle, cfg, report_coverage=True)
@@ -594,6 +716,24 @@ def live_signals(cfg: Config, output_root: str | Path = "artifacts") -> pd.DataF
 
         label_long = build_label(bundle.prices, bundle.benchmark, cfg)
         ic_report = factor_ic_report(factor_long, label_long, cfg)
+        regime_ctx = None
+        if bool(getattr(cfg.factors, "composite_regime_rotate", False)) and not bundle.benchmark.empty:
+            # 与研究路径同构：全历史点内分域（推理日已知当日收盘前状态用昨日值，
+            # 这里用截至最新数据的状态划分，无未来函数）
+            bench_close = bundle.benchmark.set_index("date")["close"].sort_index()
+            ma = bench_close.rolling(
+                int(getattr(cfg.factors, "composite_regime_ma", 120)), min_periods=60
+            ).mean()
+            bull_all = (bench_close > ma).dropna()
+            bull_dates = {pd.Timestamp(d) for d in bull_all[bull_all].index}
+            din = pd.to_datetime(factor_long["date"])
+            f_bull = factor_long[din.isin(pd.to_datetime(sorted(bull_dates)))]
+            l_bull = label_long[pd.to_datetime(label_long["date"]).isin(pd.to_datetime(sorted(bull_dates)))]
+            f_bear = factor_long[~din.isin(pd.to_datetime(sorted(bull_dates)))]
+            l_bear = label_long[~pd.to_datetime(label_long["date"]).isin(pd.to_datetime(sorted(bull_dates)))]
+            ic_bull = factor_ic_report(f_bull, l_bull, cfg) if len(f_bull) and len(l_bull) else None
+            ic_bear = factor_ic_report(f_bear, l_bear, cfg) if len(f_bear) and len(l_bear) else None
+            regime_ctx = (bull_dates, ic_bull, ic_bear)
         composite = build_composite_factor(
             factor_long,
             ic_report,
@@ -602,6 +742,9 @@ def live_signals(cfg: Config, output_root: str | Path = "artifacts") -> pd.DataF
             corr_max=cfg.factors.composite_corr_max,
             require_stable_decay=cfg.factors.composite_require_decay,
             weight_by=cfg.factors.composite_weight,
+            regime_bull_dates=regime_ctx[0] if regime_ctx else None,
+            ic_report_bull=regime_ctx[1] if regime_ctx else None,
+            ic_report_bear=regime_ctx[2] if regime_ctx else None,
         )
         if not composite.empty:
             log.info("复合因子已构建（成分 %d 个）", composite["factor"].nunique())
@@ -623,6 +766,7 @@ def live_signals(cfg: Config, output_root: str | Path = "artifacts") -> pd.DataF
     else:
         proba_cols["h1"] = latest["model"].predict_proba(X)[:, 1]
     # 部署校准：与研究流程的 OOF 校准保持一致（校准后再做截面分位）
+    raw_proba_cols = dict(proba_cols)
     calibrator = latest.get("calibrator")
     if calibrator is not None:
         for col in list(proba_cols):
@@ -630,8 +774,16 @@ def live_signals(cfg: Config, output_root: str | Path = "artifacts") -> pd.DataF
     proba_df = pd.DataFrame(proba_cols, index=feats.index)
     # 多周期集成：截面分位等权平均
     ensemble = proba_df.rank(pct=True).mean(axis=1)
-    signals = pd.DataFrame({"symbol": feats.index, "date": latest_date, "score": ensemble})
-    signals = signals.sort_values("score", ascending=False).reset_index(drop=True)
+    # 次级排序键：校准前原始集成分。isotonic 阶梯会把大量股票映射到同一
+    # 分数档（1052 只仅 139 档），top-N 截断在并列组内退化为任意选择；
+    # 原始概率是连续值，可确定性地恢复组内顺序，不改变组间校准序。
+    raw_ensemble = pd.DataFrame(raw_proba_cols, index=feats.index).rank(pct=True).mean(axis=1)
+    signals = pd.DataFrame(
+        {"symbol": feats.index, "date": latest_date, "score": ensemble, "raw_score": raw_ensemble}
+    )
+    signals = signals.sort_values(
+        ["score", "raw_score"], ascending=False
+    ).reset_index(drop=True)
     out_dir = ensure_dir(Path(output_root) / "signals")
     signals.to_csv(out_dir / f"signals_{latest_date.date()}.csv", index=False)
     signals.to_json(out_dir / f"signals_{latest_date.date()}.json", orient="records", indent=2)

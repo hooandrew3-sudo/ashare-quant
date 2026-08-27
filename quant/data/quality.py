@@ -16,6 +16,7 @@ class QualityReport:
     ok: bool = True
     checks: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
     def add(self, name: str, passed: bool, detail: str = "") -> None:
         self.checks.append(name)
@@ -23,9 +24,15 @@ class QualityReport:
             self.ok = False
             self.errors.append(f"{name}: {detail}" if detail else name)
 
+    def add_warning(self, name: str, detail: str = "") -> None:
+        """非致命告警：记录但不阻断流水线（如新股上市首日无涨跌幅限制）。"""
+        self.checks.append(name)
+        self.warnings.append(f"{name}: {detail}" if detail else name)
+
     def summary(self) -> str:
         status = "PASS" if self.ok else "FAIL"
-        return f"[{status}] {len(self.checks)} 项检查, {len(self.errors)} 项失败"
+        extra = f", {len(self.warnings)} 项警告" if self.warnings else ""
+        return f"[{status}] {len(self.checks)} 项检查, {len(self.errors)} 项失败{extra}"
 
 
 def _fmt(x) -> str:
@@ -72,6 +79,22 @@ def check_prices(df: pd.DataFrame, allow_empty: bool = False) -> QualityReport:
     if "date" in df.columns:
         dmin, dmax = df["date"].min(), df["date"].max()
         rep.add("date_range", pd.Timestamp(dmax) > pd.Timestamp(dmin), f"范围 {dmin} ~ {dmax}")
+
+    # 单日涨跌幅异常告警（最后防线）：正常 A 股个股单日收益极少超过板块
+    # 上限太多；前复权增量拼接断裂（除权日接缝两侧比例尺不同）会表现为
+    # 大幅虚假跳空。因新股上市初期无涨跌幅限制，此检查为警告而非致命。
+    if {"date", "symbol", "close"} <= set(df.columns):
+        d = df.dropna(subset=["close"]).sort_values(["symbol", "date"]).copy()
+        d["prev_close"] = d.groupby("symbol")["close"].shift(1)
+        d["ret"] = d["close"] / d["prev_close"] - 1.0
+        bad = d[d["ret"].abs() > 0.35]
+        if len(bad) > len(d) * 0.001:
+            rep.add_warning(
+                "daily_return_jump",
+                f"{len(bad)}/{len(d)} 处单日 |涨跌幅|>35%"
+                f"（疑似复权断裂或脏数据），示例: "
+                f"{bad[['symbol', 'date', 'ret']].head(3).to_dict('records')}",
+            )
     return rep
 
 

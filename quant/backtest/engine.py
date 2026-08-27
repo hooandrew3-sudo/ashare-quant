@@ -53,6 +53,23 @@ class BacktestEngine:
         self.fills = FillSimulator(prices, self.cost)
         cal = self.benchmark["date"] if not self.benchmark.empty else prices["date"]
         self.trading_dates = pd.DatetimeIndex(sorted(pd.unique(cal)))
+        # 基准收盘价按日期建索引（此前每日布尔掩码全表扫描，O(D×B)）
+        if not self.benchmark.empty:
+            self._bench_close = self.benchmark.set_index("date")["close"].sort_index()
+        else:
+            self._bench_close = pd.Series(dtype=float)
+        # 股息率修正：把估算股息按日计提进基准指数（近全收益口径），
+        # 消除"组合吃红利、基准不吃"的系统性超额高估
+        div_daily = float(getattr(bt_cfg, "benchmark_dividend_yield", 0.0) or 0.0) / 243.0
+        if not self._bench_close.empty and len(self._bench_close) > 1:
+            if div_daily > 0:
+                rets = self._bench_close.pct_change()
+                rets.iloc[0] = 0.0
+                first = float(self._bench_close.iloc[0])
+                # 首日不计息，保证调整后序列首值与原指数一致（归一化基准不变）
+                self._bench_close = first * (1.0 + rets + div_daily).cumprod()
+        # 止损冷却黑名单：sym -> 禁止回购的截止日期
+        self._stop_blacklist: dict[str, pd.Timestamp] = {}
 
     # ---------- 主流程 ----------
     def run(
@@ -85,10 +102,12 @@ class BacktestEngine:
 
         regime_map: dict[pd.Timestamp, float] = {}
         if regime is not None and not regime.empty:
-            regime_map = {
-                pd.Timestamp(d): float(r)
-                for d, r in zip(regime["date"], regime["target_exposure"])
-            }
+            for d, r in zip(regime["date"], regime["target_exposure"]):
+                v = float(r)
+                # NaN 暴露（均线 warm-up）不得进入状态机：此前 _smooth_exposure
+                # 遇 NaN 会静默返回 prev-step，每期无声降仓 0.25
+                if np.isfinite(v):
+                    regime_map[pd.Timestamp(d)] = v
         signal_health_map: dict[pd.Timestamp, float] = {}
         if signal_health is not None and not signal_health.empty:
             signal_health_map = {
@@ -107,7 +126,8 @@ class BacktestEngine:
         order_queue: list[dict] = []      # 待执行订单
         equity_rows: list[dict] = []
         trade_rows: list[dict] = []
-        bench0 = float(self.benchmark.iloc[0]["close"])
+        # 归一化基准取（可能含股息计提的）调整序列首值，保证起点=initial_cash
+        bench0 = float(self._bench_close.iloc[0]) if not self._bench_close.empty else 1.0
         current_exposure = 1.0
         prev_equity = float(self.bt.initial_cash)
         no_buy_today: set[str] = set()  # 当日因止损/熔断卖出的标的，禁止同日回补
@@ -124,17 +144,25 @@ class BacktestEngine:
                 for sym, p in positions.items()
             )
             equity = cash + close_val
-            bench_close = float(self.benchmark.loc[self.benchmark["date"] == date, "close"].iloc[0])
+            bench_close = self._bench_close.get(date)
+            if bench_close is None or not np.isfinite(bench_close):
+                # 防御：调仓日缺基准价时取此前最近值（此前实现会直接 IndexError）
+                hist = self._bench_close[self._bench_close.index <= date]
+                bench_close = float(hist.iloc[-1]) if len(hist) else 0.0
+            else:
+                bench_close = float(bench_close)
 
             # ---- 3. 止损信号（收盘触发，次日开盘卖） ----
-            for sym, p in list(positions.items()):
-                if p["shares"] <= 0:
-                    continue
-                cur = self.fills.last_close(sym, date)
-                if stop_hit(p["entry"], cur, self.pf.stop_loss):
-                    self._queue_sell(
-                        order_queue, sym, p["shares"], self._next_trading_day(date), "stop_loss"
-                    )
+            next_day_t = self._next_trading_day(date)
+            if next_day_t is not None:
+                for sym, p in list(positions.items()):
+                    if p["shares"] <= 0:
+                        continue
+                    cur = self.fills.last_close(sym, date)
+                    if stop_hit(p["entry"], cur, self.pf.stop_loss):
+                        self._queue_sell(
+                            order_queue, sym, p["shares"], next_day_t, "stop_loss"
+                        )
 
             # ---- 4. 调仓信号（T 收盘决策，T+1 开盘执行） ----
             if date in target_map:
@@ -149,31 +177,46 @@ class BacktestEngine:
                 # 小盘辅助择时：中证1000 跌破 MA250 时降仓
                 if self.pf.smallcap_regime_enabled:
                     target_exposure = target_exposure * smallcap_map.get(date, 1.0)
-                # 仓位渐变：避免状态机跃变导致整体大额调仓
-                exposure = _smooth_exposure(current_exposure, target_exposure, self.pf.exposure_step)
-                current_exposure = exposure
                 tw = target_map[date]
-                # 换手率硬上限：近 252 日实际换手超过 max_turnover_annual 时跳过调仓
+                # 换手率硬上限：近 365 日实际换手超过 max_turnover_annual 时，
+                # 跳过买入但保留纯减仓通道（风险削减动作不得被换手预算否决）
+                sells_only = False
                 if self._turnover_breached(trade_rows, equity_rows):
                     self.log.warning(
-                        "换手率超限（>%.0fx/年），跳过 %s 调仓",
+                        "换手率超限（>%.0fx/年），%s 调仓仅执行减仓订单",
                         self.pf.max_turnover_annual, date.date(),
                     )
-                    continue
+                    sells_only = True
                 # 重叠度门槛：新组合与当前持仓高度重合时跳过调仓（降低噪声换手）
-                if self.pf.min_overlap > 0 and last_target is not None:
+                elif (
+                    self.pf.min_overlap > 0
+                    and last_target is not None
+                    and len(set(tw.index) & set(last_target.index)) / max(len(tw.index), 1)
+                    >= self.pf.min_overlap
+                ):
                     overlap = len(set(tw.index) & set(last_target.index)) / max(
                         len(tw.index), 1
                     )
-                    if overlap >= self.pf.min_overlap:
-                        self.log.info(
-                            "调仓跳过 %s: 组合重叠 %.0f%% ≥ %.0f%%",
-                            date.date(), overlap * 100, self.pf.min_overlap * 100,
-                        )
-                        continue
-                last_target = tw
+                    self.log.info(
+                        "调仓跳过 %s: 组合重叠 %.0f%% ≥ %.0f%%",
+                        date.date(), overlap * 100, self.pf.min_overlap * 100,
+                    )
+                    continue
+                exposure = _smooth_exposure(current_exposure, target_exposure, self.pf.exposure_step)
+                if not sells_only:
+                    current_exposure = exposure
+                    last_target = tw
+                else:
+                    # 仅减仓路径：状态只允许下调，禁止向上漂移
+                    current_exposure = min(current_exposure, exposure)
+                if next_day_t is None:
+                    self.log.warning("已到数据末端，%s 调仓无法执行（无下一交易日）", date.date())
+                    continue
                 self._schedule_rebalance(
-                    order_queue, positions, tw, equity, exposure, date
+                    order_queue, positions, tw, equity,
+                    current_exposure, date,
+                    exec_date=next_day_t,
+                    allow_buys=not sells_only,
                 )
 
             # ---- 5. 执行今日订单（开盘） ----
@@ -201,8 +244,8 @@ class BacktestEngine:
             # ---- 尾部熔断：单日亏损超阈值，次日等比减仓 ----
             if self.bt.circuit_breaker_enabled and prev_equity > 0:
                 daily_ret = equity / prev_equity - 1.0
-                if daily_ret <= -abs(self.bt.circuit_breaker_daily_dd):
-                    next_day = self._next_trading_day(date)
+                next_day_cb = self._next_trading_day(date)
+                if daily_ret <= -abs(self.bt.circuit_breaker_daily_dd) and next_day_cb is not None:
                     reduce = 1.0 - self.bt.circuit_breaker_scale
                     for sym, p in positions.items():
                         if p["shares"] <= 0 or p["available"] <= 0:
@@ -211,10 +254,17 @@ class BacktestEngine:
                             p["available"] * reduce // self.bt.lot_size * self.bt.lot_size
                         )
                         if sell_shares > 0:
-                            self._queue_sell(order_queue, sym, sell_shares, next_day, "circuit_breaker")
+                            self._queue_sell(order_queue, sym, sell_shares, next_day_cb, "circuit_breaker")
                     self.log.warning("尾部熔断触发 %s: 日亏损 %.2f%%", date.date(), daily_ret * 100)
-            # ---- 尾部风险：CVaR 约束（历史模拟法） ----
-            if self.pf.cvar_enabled and prev_equity > 0:
+            # ---- 尾部风险：CVaR 约束（历史模拟法 + 冷却期防死亡螺旋） ----
+            # 此前无冷却：阈值一旦偏紧（旧默认 -0.5%）会"每天触发→每日砍半仓"，
+            # 数日内把组合连砍到清空且每次都付印花税。现强制两次触发间隔 ≥
+            # cvar_cooldown_days 个交易日。
+            if (
+                self.pf.cvar_enabled
+                and prev_equity > 0
+                and self._cvar_cooldown_ok(date)
+            ):
                 cvar_info = check_cvar_limit(
                     positions,
                     self.prices,
@@ -222,8 +272,9 @@ class BacktestEngine:
                     lookback=self.pf.cvar_lookback,
                     alpha=self.pf.cvar_alpha,
                 )
-                if cvar_info["triggered"]:
-                    next_day = self._next_trading_day(date)
+                next_day_cvar = self._next_trading_day(date)
+                if cvar_info["triggered"] and next_day_cvar is not None:
+                    self._last_cvar_trigger = date
                     for sym, p in list(positions.items()):
                         if p["shares"] <= 0 or p.get("available", 0) <= 0:
                             continue
@@ -231,7 +282,7 @@ class BacktestEngine:
                             p["shares"] * 0.5 // self.bt.lot_size * self.bt.lot_size
                         )
                         if sell_shares > 0:
-                            self._queue_sell(order_queue, sym, sell_shares, next_day, "cvar_limit")
+                            self._queue_sell(order_queue, sym, sell_shares, next_day_cvar, "cvar_limit")
                     self.log.warning(
                         "CVaR 约束触发 %s: cvar=%.4f < %.4f",
                         date.date(),
@@ -275,9 +326,16 @@ class BacktestEngine:
         equity: float,
         exposure: float,
         signal_date: pd.Timestamp,
+        exec_date: pd.Timestamp | None = None,
+        allow_buys: bool = True,
     ) -> None:
-        """按目标权重生成次日订单。"""
-        exec_date = self._next_trading_day(signal_date)
+        """按目标权重生成次日订单。allow_buys=False 时仅生成减仓订单
+        （换手超限时的风险削减通道：调出仓 + 超配减持照常执行）。"""
+        if exec_date is None:
+            exec_date = self._next_trading_day(signal_date)
+        if exec_date is None:
+            self.log.warning("无下一交易日，%s 调仓订单全部丢弃", signal_date.date())
+            return
         investable = equity * exposure
         held = set(positions.keys())
         target_syms = set(target.index)
@@ -287,6 +345,20 @@ class BacktestEngine:
             self._queue_sell(queue, sym, positions[sym]["shares"], exec_date, "rebalance_out")
 
         for sym, w in target.items():
+            if not allow_buys:
+                # 仅减仓：只处理"当前持仓且目标更低"的减持，不新开/加仓
+                if sym not in positions or positions[sym]["shares"] <= 0:
+                    continue
+                px = self.fills.last_close(sym, signal_date)
+                if pd.isna(px) or px <= 0:
+                    continue
+                cur_val = positions[sym]["shares"] * px
+                diff = equity * exposure * float(w) - cur_val
+                shares = self.cost.round_lot(-diff / px) if diff < 0 else 0
+                shares = min(shares, positions[sym]["available"])
+                if shares > 0:
+                    self._queue_sell(queue, sym, shares, exec_date, "rebalance")
+                continue
             target_val = investable * float(w)
             if sym in positions and positions[sym]["shares"] > 0:
                 cur_val = positions[sym]["shares"] * self.fills.last_close(sym, signal_date)
@@ -328,16 +400,21 @@ class BacktestEngine:
                     )
 
     def _turnover_breached(self, trade_rows: list[dict], equity_rows: list[dict]) -> bool:
-        """近 365 日累计成交额 / 同期平均净值 > max_turnover_annual 时返回 True。"""
+        """近 365 日累计成交额 / 同期平均净值 > max_turnover_annual 时返回 True。
+
+        此前对 trade_rows/equity_rows 各截尾 [-5000:]，高频调仓下会丢早期
+        成交记录 → 低估滚动换手 → 熔断形同虚设；现按日期直接过滤全量记录。
+        """
         if self.pf.max_turnover_annual <= 0:
             return False
         if len(trade_rows) < 20 or len(equity_rows) < 20:
             return False
-        trades = pd.DataFrame(trade_rows[-5000:])
-        filled = trades[trades["status"] == "filled"]
-        if filled.empty or "date" not in filled.columns:
+        trades = pd.DataFrame(trade_rows)
+        if "date" not in trades.columns or "status" not in trades.columns:
             return False
-        filled = filled.copy()
+        filled = trades[trades["status"] == "filled"].copy()
+        if filled.empty:
+            return False
         filled["date"] = pd.to_datetime(filled["date"])
         cutoff = filled["date"].max() - pd.Timedelta(days=365)
         recent_t = filled[filled["date"] >= cutoff]
@@ -354,7 +431,7 @@ class BacktestEngine:
         # 单边口径：买卖金额取平均，与 performance.turnover_annual 统一
         amount = (buy_amt + sell_amt) / 2.0
 
-        eq = pd.DataFrame(equity_rows[-5000:])
+        eq = pd.DataFrame(equity_rows)
         if eq.empty or "date" not in eq.columns or "portfolio_value" not in eq.columns:
             return False
         eq = eq.copy()
@@ -366,11 +443,28 @@ class BacktestEngine:
         annual_turnover = amount / avg_equity
         return annual_turnover > self.pf.max_turnover_annual
 
-    def _next_trading_day(self, date: pd.Timestamp) -> pd.Timestamp:
+    def _next_trading_day(self, date: pd.Timestamp) -> pd.Timestamp | None:
+        """返回 date 的下一交易日；数据末端无下一交易日时返回 None。
+
+        此前实现回返当日，导致末日收盘决策的订单以当日开盘价成交
+        （末日前视：止损单"逃在暴跌开盘前"）。现由调用方丢弃该类订单。
+        """
         idx = self.trading_dates.searchsorted(date)
         if idx < len(self.trading_dates) - 1:
             return self.trading_dates[idx + 1]
-        return date  # 无下一交易日：原地处理（边界）
+        return None
+
+    def _cvar_cooldown_ok(self, date: pd.Timestamp) -> bool:
+        """CVaR 减仓冷却：距上次触发不足 cooldown 个交易日则跳过。"""
+        last = getattr(self, "_last_cvar_trigger", None)
+        if last is None:
+            return True
+        cooldown = int(getattr(self.pf, "cvar_cooldown_days", 20) or 0)
+        if cooldown <= 0:
+            return True
+        pos_now = self.trading_dates.searchsorted(date)
+        pos_last = self.trading_dates.searchsorted(pd.Timestamp(last))
+        return (pos_now - pos_last) >= cooldown
 
     def _execute(
         self,
@@ -393,6 +487,17 @@ class BacktestEngine:
                             "date": date, "symbol": sym, "side": side,
                             "shares": 0, "price": fill.price, "fee": 0.0,
                             "status": "skipped", "reason": "no_buy_after_stop",
+                        }
+                    )
+                    return cash
+                # 止损冷却黑名单：防止"止损→下月原样买回→再止损"循环摩擦
+                until = self._stop_blacklist.get(sym)
+                if until is not None and date < until:
+                    trade_rows.append(
+                        {
+                            "date": date, "symbol": sym, "side": side,
+                            "shares": 0, "price": fill.price, "fee": 0.0,
+                            "status": "skipped", "reason": "stop_loss_cooldown",
                         }
                     )
                     return cash
@@ -448,6 +553,12 @@ class BacktestEngine:
                 entry_price = entry
                 if order["reason"] in ("stop_loss", "circuit_breaker", "cvar_limit"):
                     no_buy_today.add(sym)
+                if order["reason"] == "stop_loss":
+                    cooldown_days = int(getattr(self.pf, "stop_loss_cooldown_days", 63) or 0)
+                    if cooldown_days > 0:
+                        pos_idx = self.trading_dates.searchsorted(date)
+                        cd_idx = min(pos_idx + cooldown_days, len(self.trading_dates) - 1)
+                        self._stop_blacklist[sym] = self.trading_dates[cd_idx]
             trade_rows.append(
                 {
                     "date": date, "symbol": sym, "side": side,
@@ -459,8 +570,9 @@ class BacktestEngine:
         elif fill.status == "postponed":
             # 停牌/跌停/无行情：买卖双方都按 postpone_max_days 顺延，超期丢弃
             order["days_left"] -= 1
-            if order["days_left"] > 0:
-                order["exec_date"] = self._next_trading_day(date)
+            next_day = self._next_trading_day(date)
+            if order["days_left"] > 0 and next_day is not None:
+                order["exec_date"] = next_day
                 queue.append(order)
             else:
                 trade_rows.append(
@@ -496,7 +608,9 @@ class BacktestEngine:
 
 
 def _smooth_exposure(prev: float, target: float, step: float) -> float:
-    """仓位渐变：每期最多朝目标移动 step。"""
+    """仓位渐变：每期最多朝目标移动 step。非有限目标（NaN/inf）保持原仓位。"""
+    if target is None or not np.isfinite(target):
+        return prev
     delta = target - prev
     if abs(delta) <= step:
         return target

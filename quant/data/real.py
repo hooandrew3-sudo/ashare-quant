@@ -78,7 +78,66 @@ def load_from_baostock(
         raise RuntimeError("baostock 未返回任何数据，请检查日期范围与代码格式")
     if inc and storage is not None and storage.has("prices"):
         existing = storage.load("prices")
-        raw = merge_incremental(existing, raw)
+        # ---- 复权接缝自愈（审计 P0-1 运行期防线）----
+        # 前复权价以抓取时刻为锚：除权后增量拼接会在接缝处产生虚假跳空。
+        # 检测 ①历史库内已有断裂 ②本次增量边界的锚点漂移，
+        # 命中 symbol 从原始 start 全量重拉，使整条历史回到同一锚点。
+        from quant.data.baostock_sync import detect_adjustment_breaks, detect_anchor_shift
+
+        import json as _json
+
+        quirks_path = storage.root / "cache" / "adjustment_quirks.json"
+        known_quirks: set[str] = set()
+        try:
+            if quirks_path.exists():
+                known_quirks = set(_json.loads(quirks_path.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            pass
+
+        affected = set(detect_adjustment_breaks(existing))
+        boundary_shifted = set(
+            detect_anchor_shift(existing, raw, sync_start)
+        )
+        if boundary_shifted:
+            log.warning(
+                "增量边界检测到 %d 只股票复权锚点漂移（除权事件）: %s...",
+                len(boundary_shifted), sorted(boundary_shifted)[:5],
+            )
+            affected |= boundary_shifted
+        # 已知数据源固有缺陷（退市整理期复牌日 baostock 复权序列自身不连续，
+        # 全量重拉无法消除）：不再重复重拉，仅保留告警
+        to_refetch = sorted(affected - known_quirks)
+        if to_refetch:
+            log.warning("全量重拉 %d 只股票以修复复权接缝…", len(to_refetch))
+            cal_full = sync.trading_calendar(_fmt_date(start), _fmt_date(end))
+            full_frames, _ = sync.fetch_daily(
+                to_refetch,
+                _fmt_date(start),
+                _fmt_date(end),
+                calendar=cal_full,
+                basic=basic,
+            )
+            keep = existing[~existing["symbol"].isin(to_refetch)]
+            raw = merge_incremental(
+                merge_incremental(keep, full_frames), raw
+            )
+            # 重拉后仍断裂的 symbol 属数据源固有缺陷，记入白名单
+            still = set(detect_adjustment_breaks(raw[raw["symbol"].isin(to_refetch)]))
+            new_quirks = still - known_quirks
+            if new_quirks:
+                log.warning(
+                    "%d 只股票为 baostock 数据源固有断裂（退市整理期），已记录白名单: %s",
+                    len(new_quirks), sorted(new_quirks),
+                )
+                known_quirks |= new_quirks
+                quirks_path.parent.mkdir(parents=True, exist_ok=True)
+                quirks_path.write_text(
+                    _json.dumps(sorted(known_quirks)), encoding="utf-8"
+                )
+        else:
+            if affected:
+                log.info("检测到 %d 只已知源缺陷股，跳过重拉（见 adjustment_quirks.json）", len(affected))
+            raw = merge_incremental(existing, raw)
 
     benchmark_df = pd.DataFrame(
         {
@@ -101,12 +160,67 @@ def load_from_baostock(
     ].copy()
     industry = industry[industry["symbol"].isin(norm_symbols)].copy()
     industry["as_of_date"] = pd.to_datetime(industry["as_of_date"], errors="coerce")
+
+    # ---- PIT 成分快照（幸存者偏差消除，增量式）----
+    # 用月末序列拉取历史成员并集；与当前快照 universe 的差异部分
+    # （退市/调出股）也一并纳入，保证历史时点的横截面真实。
+    # 增量语义：已有快照月份不重拉（省 4~5 分钟/日），仅补缺失月份。
+    constituents_df = pd.DataFrame(columns=["snapshot_date", "symbol"])
+    try:
+        existing_pit = (
+            storage.load("constituents")
+            if storage is not None and storage.has("constituents")
+            else pd.DataFrame(columns=["snapshot_date", "symbol"])
+        )
+        if not benchmark_df.empty:
+            month_ends = [
+                str(x)[:10]
+                for x in benchmark_df.set_index("date")["close"]
+                .resample("ME")
+                .last()
+                .index
+            ]
+            done: set[str] = set()
+            if not existing_pit.empty:
+                done = {
+                    str(pd.Timestamp(d).date())
+                    for d in existing_pit["snapshot_date"].unique()
+                }
+            todo = [d for d in month_ends if d[:10] not in done]
+            if todo:
+                log.info("PIT 成分快照需补拉 %d/%d 期", len(todo), len(month_ends))
+                fresh = sync.constituents_pit(todo)
+            else:
+                fresh = pd.DataFrame(columns=["snapshot_date", "symbol"])
+            if not existing_pit.empty or not fresh.empty:
+                constituents_df = pd.concat(
+                    [existing_pit, fresh], ignore_index=True
+                ).drop_duplicates(subset=["snapshot_date", "symbol"])
+                # concat 后可能混入 object 类型的 Timestamp（旧库 datetime64
+                # + 新拉 Timestamp），统一规范化，否则 to_parquet 无法推断类型
+                constituents_df["snapshot_date"] = pd.to_datetime(
+                    constituents_df["snapshot_date"]
+                ).astype("datetime64[ns]")
+                constituents_df = constituents_df.sort_values(
+                    ["snapshot_date", "symbol"]
+                ).reset_index(drop=True)
+            if not constituents_df.empty:
+                log.info(
+                    "PIT 成分快照: %d 期 / 覆盖股票 %d 只（本期新增 %d 期）",
+                    constituents_df["snapshot_date"].nunique(),
+                    constituents_df["symbol"].nunique(),
+                    len(fresh),
+                )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("PIT 成分拉取失败（回退当前快照口径，存在幸存者偏差）: %s", exc)
+
     return DataBundle(
         prices=raw,
         benchmark=benchmark_df,
         meta=meta,
         industry=industry,
         fundamentals=pd.DataFrame(),
+        constituents=constituents_df,
     )
 
 

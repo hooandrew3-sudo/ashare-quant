@@ -63,6 +63,13 @@ class FactorConfig:
     composite_corr_max: float = 0.6
     composite_require_decay: bool = True
     composite_weight: str = "icir"  # icir | t | equal
+    # regime 条件化复合权重：牛市/熊市分域估计成分与权重（牛偏动量/盈利改善，
+    # 熊偏价值/低波），逐日按基准均线状态选用；分域样本不足自动回退全窗口权重
+    composite_regime_rotate: bool = False
+    composite_regime_ma: int = 120   # 牛熊判定均线（交易日）
+    # IC t 统计量的 Newey-West 校正滞后阶数：取标签 horizon（20）以校正
+    # 重叠标签自相关；此前朴素 t 被高估约 sqrt(horizon) 倍，显著性门槛失效
+    ic_nw_lag: int = 20
     # 因子健康度哨兵：连续 N 日原始覆盖度低于阈值时告警（防因子静默退化）
     coverage_watch: list[str] = field(default_factory=lambda: ["consensus_revision"])
     coverage_min_ratio: float = 0.3
@@ -130,6 +137,7 @@ class PortfolioConfig:
     max_turnover_annual: float = 4.0  # 年化换手硬上限（超过则自动跳过调仓）
     stickiness: float = 0.80
     stop_loss: float = 0.12
+    stop_loss_cooldown_days: int = 63  # 止损后禁复购冷却期（交易日，防止损-回补循环）
     band: float = 0.25
     exposure_step: float = 0.25  # 状态机仓位每期最大变动，平滑换手
     min_overlap: float = 0.85    # 新组合与当前持仓重叠 ≥ 该比例时跳过调仓
@@ -149,9 +157,12 @@ class PortfolioConfig:
     min_avg_amount: float = 50_000_000
     max_smallcap_ratio: float = 0.30  # 组合中小市值股票（成交额 bottom 30%）数量占比上限
     cvar_enabled: bool = False
-    cvar_threshold: float = -0.005
+    # CVaR 触发阈值（日度 ES）：30 只股票组合的 ES(5%) 常态在 -2%~-3%，
+    # 旧默认 -0.005 一旦启用会"每天触发→每日砍半仓"死亡螺旋，故校准为 -0.03
+    cvar_threshold: float = -0.03
     cvar_lookback: int = 252
     cvar_alpha: float = 0.05
+    cvar_cooldown_days: int = 20  # 两次 CVaR 减仓的最小间隔（交易日），防连续拆仓
     regime: RegimeConfig = field(default_factory=RegimeConfig)
 
 
@@ -167,6 +178,10 @@ class BacktestConfig:
     min_commission: float = 5.0
     lot_size: int = 100
     postpone_max_days: int = 5
+    # 基准股息率修正：中证800 价格指数不含分红，而组合隐含享受红利再投，
+    # 超额/IR 年化被系统性抬高约 2~2.5pp。设为估算年化股息率（如 0.02）时
+    # 引擎按日计提计入基准曲线，接近全收益指数口径；0 表示不修正。
+    benchmark_dividend_yield: float = 0.0
     slippage_model: str = "fixed"       # fixed | adaptive（按订单额/日均成交额动态冲击）
     slippage_cap_bp: float = 20.0
     slippage_impact_coef: float = 5.0
@@ -303,6 +318,31 @@ class Config:
         ):
             if value <= 0:
                 raise ValueError(f"配置 {name} 必须为正数，当前为 {value}")
+        # P1 数值范围校验：此前 lot_size=0 会让 paper 缩量循环死循环，
+        # 负费率/超限权重等也会静默产生荒谬结果
+        for name, value, lo, hi in (
+            ("backtest.lot_size", self.backtest.lot_size, 1, None),
+            ("backtest.initial_cash", self.backtest.initial_cash, 1.0, None),
+            ("backtest.commission_bp", self.backtest.commission_bp, 0.0, 100.0),
+            ("backtest.stamp_bp", self.backtest.stamp_bp, 0.0, 100.0),
+            ("backtest.transfer_bp", self.backtest.transfer_bp, 0.0, 100.0),
+            ("backtest.slippage_bp", self.backtest.slippage_bp, 0.0, 200.0),
+            ("backtest.min_commission", self.backtest.min_commission, 0.0, None),
+            ("portfolio.max_weight", self.portfolio.max_weight, 1e-6, 1.0),
+            ("portfolio.stop_loss", self.portfolio.stop_loss, 1e-6, 1.0),
+            ("portfolio.band", self.portfolio.band, 0.0, 1.0),
+            ("portfolio.exposure_step", self.portfolio.exposure_step, 1e-6, 1.0),
+            ("portfolio.turnover_cap", self.portfolio.turnover_cap, 1e-6, 1.0),
+            ("factors.ic_nw_lag", self.factors.ic_nw_lag, 0, None),
+            ("model.horizon", self.model.horizon, 1, None),
+        ):
+            if value < lo or (hi is not None and value > hi):
+                msg = f"配置 {name}={value} 超出合法范围 [{lo}, {hi if hi is not None else '∞'}]"
+                raise ValueError(msg)
+        if pd_is_empty_range(self.backtest.start, self.backtest.end):
+            raise ValueError(
+                f"回测区间非法: start={self.backtest.start} >= end={self.backtest.end}"
+            )
 
 
 def _build(section, data: dict[str, Any]):
@@ -324,6 +364,12 @@ def _build(section, data: dict[str, Any]):
             kwargs[f.name] = _build(ftype, value)
         elif ftype is Path and isinstance(value, str):
             kwargs[f.name] = Path(value)
+        elif ftype is bool and isinstance(value, str):
+            # YAML 中 true/false 写成字符串时按布尔语义强转，避免运行期 TypeError
+            kwargs[f.name] = value.strip().lower() in ("true", "1", "yes", "on")
+        elif ftype in (int, float) and isinstance(value, str):
+            # 数字写成字符串（如 commission_bp: "2.5"）时尽早强转并暴露格式错误
+            kwargs[f.name] = ftype(float(value)) if ftype is int and "." in value else ftype(value)
         else:
             kwargs[f.name] = value
     return section(**kwargs)
@@ -344,6 +390,20 @@ def _validate_enum(name: str, value: Any, allowed: set[str]) -> None:
         raise ValueError(
             f"配置 {name}={value!r} 非法，允许值: {sorted(allowed)}"
         )
+
+
+def pd_is_empty_range(start: str, end: str) -> bool:
+    """回测区间 start >= end 视为非法（空串表示未配置，跳过检查）。"""
+    from datetime import datetime as _dt
+
+    if not start or not end:
+        return False
+    try:
+        s = _dt.strptime(str(start)[:10], "%Y-%m-%d")
+        e = _dt.strptime(str(end)[:10], "%Y-%m-%d")
+    except ValueError:
+        return False
+    return s >= e
 
 
 def to_dict(cfg: Config) -> dict[str, Any]:

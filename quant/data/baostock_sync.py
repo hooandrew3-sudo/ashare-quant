@@ -45,6 +45,15 @@ def symbol_to_bs(symbol: str) -> str:
     return f"{suffix.lower()}.{num}"
 
 
+def _round_to_tick(px: "pd.Series") -> "pd.Series":
+    """按交易所规则四舍五入到分（round half up）。
+
+    注意不能用 Python round()/np.round：它们是银行家舍入
+    （round(2.675, 2) == 2.67），会把涨停价算低半分导致封板漏判。
+    """
+    return np.floor(px.astype(float) * 100.0 + 0.5 + 1e-9) / 100.0
+
+
 def _limit_ratio_series(
     dates: pd.Series, symbol: str, is_st: pd.Series
 ) -> pd.Series:
@@ -209,6 +218,46 @@ class BaoStockSync:
         """中证800 = 沪深300 + 中证500（当前成分快照）。"""
         return self.constituents(("hs300", "zz500"))
 
+    def constituents_pit(self, dates) -> pd.DataFrame:
+        """点内成分快照：按给定日期序列拉取 hs300+zz500 成员并集。
+
+        返回 long 表 (snapshot_date, symbol)。指数成分的幸存者偏差（用今日
+        名单回测历史）由此消除：每个历史时点只用当时真实的成员集合。
+        月末采样即可覆盖半年度调仓（≤1 个月滞后），是业界标准做法。
+        """
+        rows: list[pd.DataFrame] = []
+        date_list = [pd.Timestamp(d).strftime("%Y-%m-%d") for d in dates]
+        total = len(date_list)
+        for i, ds in enumerate(date_list, start=1):
+            codes: set[str] = set()
+            for getter in (self._bs.query_hs300_stocks, self._bs.query_zz500_stocks):
+                try:
+                    df = self._query(getter, ds)
+                except Exception as exc:  # noqa: BLE001
+                    self.log.warning("成分快照 %s 拉取失败: %s", ds, exc)
+                    continue
+                if df.empty:
+                    continue
+                col = "code" if "code" in df.columns else df.columns[0]
+                codes |= set(df[col].astype(str))
+            if codes:
+                rows.append(
+                    pd.DataFrame(
+                        {
+                            "snapshot_date": pd.Timestamp(ds),
+                            "symbol": sorted(bs_to_symbol(c) for c in codes),
+                        }
+                    )
+                )
+            if i % 12 == 0 or i == total:
+                self.log.info("PIT 成分快照进度 %d/%d", i, total)
+        if not rows:
+            return pd.DataFrame(columns=["snapshot_date", "symbol"])
+        out = pd.concat(rows, ignore_index=True).drop_duplicates(
+            subset=["snapshot_date", "symbol"]
+        )
+        return out.sort_values(["snapshot_date", "symbol"]).reset_index(drop=True)
+
     def industry(self) -> pd.DataFrame:
         """全市场行业分类（证监会行业，当前快照，静态口径）。"""
         raw = self._cached("industry", self._bs.query_stock_industry, ttl_hours=24.0)
@@ -274,6 +323,14 @@ class BaoStockSync:
             "同步完成: %d 只 / %d 行 / %.1fs / %d 个错误",
             stats.symbols, stats.rows, stats.elapsed_sec, len(stats.errors),
         )
+        # 错误率阈值：大面积失败时缺失数据静默入库比失败本身更危险
+        # （某只股票从某天起永远缺席，横截面因子每天悄悄少一只票）
+        if syms and len(stats.errors) / len(syms) > 0.2:
+            raise RuntimeError(
+                f"同步错误率 {len(stats.errors) / len(syms):.0%} 超过 20% 阈值"
+                f"（{len(stats.errors)}/{len(syms)} 只失败），拒绝入库。"
+                f"首批错误: {stats.errors[:3]}"
+            )
         if frames:
             out = pd.concat(frames, ignore_index=True)
             return out.sort_values(["symbol", "date"]).reset_index(drop=True), stats
@@ -305,27 +362,33 @@ class BaoStockSync:
         prices["pe"] = pd.to_numeric(prices["peTTM"], errors="coerce")
         prices["pb"] = pd.to_numeric(prices["pbMRQ"], errors="coerce")
         prices["is_st"] = prices["isST"].astype(str) == "1"
-        pct = pd.to_numeric(prices["pctChg"], errors="coerce").fillna(0.0)
         # 涨跌停比例按板块 + 时间演进（创业板 2020-08-24 起 20%、科创板 20%、
-        # 北交所 30%、主板/中小板 10%、ST 5%）。用 pctChg 判定“收盘封板”，
-        # 用 open vs preclose 判定“开盘一字板”（撮合层真正需要的是后者）。
+        # 北交所 30%、主板/中小板 10%、ST 5%）。收盘封板判定：close 必须
+        # ≥ 交易所规则涨停价 round_half_up(前收×(1+ratio), 2)。
+        # 此前用 pctChg≥ratio*100-0.2 的宽容差，+9.85% 未封板会被误判涨停。
         ratio = _limit_ratio_series(prices["date"], symbol, prices["is_st"])
-        pct_th = ratio * 100.0 - 0.2  # 容忍四舍五入误差
-        prices["is_limit_up"] = pct >= pct_th
-        prices["is_limit_down"] = pct <= -pct_th
+        limit_up_px = _round_to_tick(prices["preclose"] * (1.0 + ratio))
+        limit_dn_px = _round_to_tick(prices["preclose"] * (1.0 - ratio))
+        close_ok = prices["close"].notna() & prices["preclose"].notna()
+        eps = 1e-4  # 浮点比较容差（半分以下）
+        prices["is_limit_up"] = close_ok & (prices["close"] >= limit_up_px - eps)
+        prices["is_limit_down"] = close_ok & (prices["close"] <= limit_dn_px + eps)
         pre = prices["preclose"]
         open_px = prices["open"]
         open_ok = pre.notna() & open_px.notna() & (pre > 0)
-        prices["is_limit_up_open"] = open_ok & (open_px >= (pre * (1.0 + ratio) - 0.005))
-        prices["is_limit_down_open"] = open_ok & (open_px <= (pre * (1.0 - ratio) + 0.005))
+        prices["is_limit_up_open"] = open_ok & (open_px >= limit_up_px - eps)
+        prices["is_limit_down_open"] = open_ok & (open_px <= limit_dn_px + eps)
         prices["is_suspended"] = False
         # 复权因子字段：baostock 日线接口已不支持 factor 字段（2026-08 起返回
         # “指标不存在:factor”）。当前存储为常量占位，保留 schema 稳定；
         # 彻底方案（不复权价 + query_adjust_factor 复权因子）见审计报告 P1-2。
         prices["adj_factor"] = 1.0
+        # 落库 preclose：前复权序列中 preclose 恒等于库内前一交易日 close
+        # （同锚点），据此可精确检测增量拼接的锚点漂移（复权接缝），
+        # 替代"单日涨跌幅超限"启发式（后者会把退市整理期合法暴跌误判为断裂）
         return prices[
             [
-                "date", "open", "high", "low", "close", "volume", "amount",
+                "date", "open", "high", "low", "close", "preclose", "volume", "amount",
                 "turnover", "pe", "pb", "is_limit_up", "is_limit_down",
                 "is_limit_up_open", "is_limit_down_open",
                 "is_suspended", "is_st", "adj_factor",
@@ -396,6 +459,95 @@ def merge_incremental(existing: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame
     combined = combined.drop_duplicates(subset=["date", "symbol"], keep="last")
     combined = normalize_flag_columns(combined)
     return combined.sort_values(["symbol", "date"]).reset_index(drop=True)
+
+
+def detect_adjustment_breaks(
+    prices: pd.DataFrame,
+    ret_threshold: float = 0.35,
+    skip_head_bars: int = 5,
+) -> list[str]:
+    """检测已入库价格中的复权断裂（前视审计 P0-1 的运行期防线）。
+
+    前复权价以"抓取时刻"为锚：两次同步之间若发生除权，接缝两侧比例尺
+    不同。返回需要全量重拉的 symbol 列表（重拉后整条历史用同一锚点，
+    接缝自愈）。
+
+    两级判定：
+    - 精确规则（行含 preclose）：同锚点前复权序列中 preclose 应等于库内
+      前一交易日 close；不等即为锚点漂移（接缝）。对除权日、退市整理期
+      暴跌等合法行情零误报。
+    - 启发式（遗留行缺 preclose）：单日 |收益| > ret_threshold 才标记，
+      可能包含退市整理期首日等合法行情——重拉幂等无害，仅多一次带宽。
+    跳过每只股票头部 skip_head_bars 根 K 线（新股上市初期无涨跌幅限制）。
+    """
+    if prices is None or prices.empty or "close" not in prices.columns:
+        return []
+    d = prices.dropna(subset=["close"])
+    d = d.sort_values(["symbol", "date"])
+    # 跳过每只股票头部 skip_head_bars 根 K 线（新股上市初期无涨跌幅限制）
+    d = d[d.groupby("symbol").cumcount() >= skip_head_bars]
+    if d.empty:
+        return []
+    bad_syms: set[str] = set()
+
+    has_preclose = "preclose" in d.columns and d["preclose"].notna().any()
+    if has_preclose:
+        # 按 symbol 划分（非按行）：只要该股任一行有 preclose 就走精确规则，
+        # 其余行是停牌补行（close/preclose 均为 NaN）。若按行划分，启发式的
+        # pct_change 会跨停牌缺口计算，把退市整理期首日暴跌误判为接缝。
+        sym_has_pc = d.groupby("symbol")["preclose"].transform(
+            lambda s: s.notna().any()
+        ).astype(bool)
+        exact = d[sym_has_pc]
+        legacy = d[~sym_has_pc]
+        prev_close = exact.groupby("symbol")["close"].shift(1)
+        pc = pd.to_numeric(exact["preclose"], errors="coerce")
+        # 锚点漂移判定：偏差超过 max(1.5 跳, 前收 2%)。容差依据：
+        # ① 仙股前复权分位舍入噪声 ±0.01~0.02；② baostock 对个别
+        # 退市整理股在停牌日前后的 preclose 有 ±1 跳不一致。
+        # 真实接缝来自除权再缩放，偏差为百分比级，远高于该阈值。
+        tol = np.maximum(0.015, prev_close * 0.02).fillna(0.015)
+        mismatch = ((pc - prev_close).abs() > tol).fillna(False)
+        seam_mask = (pc.notna() & prev_close.notna() & mismatch).fillna(False)
+        if seam_mask.any():
+            bad_syms |= set(exact.loc[seam_mask, "symbol"].unique())
+    else:
+        legacy = d
+
+    if not legacy.empty:
+        ret = legacy.groupby("symbol")["close"].pct_change()
+        heur_bad = legacy[(ret.abs() > ret_threshold).fillna(False)]
+        bad_syms |= set(heur_bad["symbol"].unique())
+    return sorted(bad_syms)
+
+
+def detect_anchor_shift(
+    existing: pd.DataFrame,
+    new_raw: pd.DataFrame,
+    window_start: str,
+    threshold: float = 0.35,
+) -> list[str]:
+    """检测增量边界处的复权锚点漂移。
+
+    对比旧库窗口起点前的最后收盘价与新数据首个收盘价：同一锚点下该比值
+    应为正常日度涨跌幅；超过阈值说明两次同步之间发生了除权再缩放，
+    该 symbol 必须全量重拉，否则接缝将永久留在库中。
+    """
+    if existing is None or existing.empty or new_raw is None or new_raw.empty:
+        return []
+    start_ts = pd.Timestamp(window_start)
+    old = existing[existing["date"] < start_ts]
+    last_old = (
+        old.sort_values("date").groupby("symbol")["close"].last().dropna()
+    )
+    first_new = (
+        new_raw.sort_values("date").groupby("symbol")["close"].first().dropna()
+    )
+    joined = pd.concat([last_old.rename("prev"), first_new.rename("nxt")], axis=1).dropna()
+    if joined.empty:
+        return []
+    mask = (joined["prev"] > 0) & ((joined["nxt"] / joined["prev"] - 1.0).abs() > threshold)
+    return sorted(joined[mask].index.tolist())
 
 
 FLAG_COLUMNS = (

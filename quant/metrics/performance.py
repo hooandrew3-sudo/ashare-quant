@@ -31,17 +31,27 @@ def compute_metrics(
     bench_ret = bv.iloc[-1] / bv.iloc[0] - 1.0
     cagr = (pv.iloc[-1] / pv.iloc[0]) ** (1 / years) - 1.0
     daily = pv.pct_change().dropna()
-    vol = float(daily.std() * np.sqrt(252)) if len(daily) else 0.0
-    sharpe = (cagr - risk_free) / vol if vol > 0 else 0.0
+    # A 股年均交易日约 243，此前用 252 会高估波动约 1.8%
+    ann_days = 243
+    vol = float(daily.std() * np.sqrt(ann_days)) if len(daily) else 0.0
+    # Sharpe 标准口径：算术日均超额收益 / 日波动 × sqrt(N)。
+    # 此前"几何 CAGR 配算术波动"随波动率上升虚增 Sharpe，与业界不可比。
+    rf_daily = risk_free / ann_days
+    sharpe = (
+        float((daily.mean() - rf_daily) / daily.std() * np.sqrt(ann_days))
+        if len(daily) and daily.std() > 0
+        else 0.0
+    )
     mdd = max_drawdown(pv)
     calmar = cagr / abs(mdd) if mdd < 0 else float("inf")
 
-    excess_daily = daily - bv.pct_change().dropna().reindex(daily.index).fillna(0.0)
-    ir = float(excess_daily.mean() / excess_daily.std() * np.sqrt(252)) if excess_daily.std() > 0 else 0.0
+    bench_daily = bv.pct_change().reindex(daily.index).fillna(0.0)
+    excess_daily = daily - bench_daily
+    ir = float(excess_daily.mean() / excess_daily.std() * np.sqrt(ann_days)) if excess_daily.std() > 0 else 0.0
 
-    # alpha/beta（OLS）
+    # alpha/beta（OLS；alpha 为对基准的年化超额截距，未减无风险利率）
     y = daily.to_numpy()
-    x = bv.pct_change().dropna().reindex(daily.index).fillna(0.0).to_numpy()
+    x = bench_daily.to_numpy()
     A = np.vstack([x, np.ones(len(x))]).T
     beta, alpha = np.linalg.lstsq(A, y, rcond=None)[0]
 
@@ -63,7 +73,7 @@ def compute_metrics(
         "max_drawdown": round(mdd, 4),
         "calmar": round(float(calmar), 3) if calmar != float("inf") else None,
         "information_ratio": round(float(ir), 3),
-        "alpha": round(float(alpha * 252), 5),
+        "alpha": round(float(alpha * ann_days), 5),
         "beta": round(float(beta), 3),
         "monthly_win_rate": round(monthly_win_rate, 4),
         "turnover_annual": round(float(turnover), 4),

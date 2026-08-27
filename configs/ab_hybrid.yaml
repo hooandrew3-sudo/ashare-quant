@@ -1,0 +1,51 @@
+# 折中方案：REAL 的信号层 (多周期/多种子) + DEFAULT 的组合层 (月度调仓/高换手/beta放大)
+# 假设：保留 REAL 的 OOS IC IR 优势，同时避免季度调仓导致 2025 大牛市完全错过
+# 配置指纹预期：不同于 default(6651b9cbc504) 和 real(797ba5f8960f)，是新的 hybrid fingerprint
+data:
+  source: parquet
+  root: data
+  benchmark: "000906.SH"
+  sync:
+    universe: csi800
+    start: "2021-01-01"
+    end: ""
+    incremental: true
+
+factors:
+  composite_weight: t          # 来自 REAL：t 加权 IC IR 更优
+  composite_require_decay: false
+
+model:
+  name: auto
+  n_splits: 5
+  horizons: [5, 10, 20, 40]    # 来自 REAL：多周期集成
+  n_seeds: 3                   # 来自 REAL：多种子平均
+  label_mode: binary
+  params:
+    n_estimators: 250          # 来自 REAL
+    learning_rate: 0.05
+    num_leaves: 31
+    min_child_samples: 30
+    subsample: 0.8
+    colsample_bytree: 0.8
+
+portfolio:
+  top_n: 30
+  target_vol: 0.10
+  stickiness: 0.80             # 来自 DEFAULT（降低）
+  band: 0.15
+  exposure_step: 0.25
+  turnover_cap: 0.40           # 来自 DEFAULT（提高），保留进攻弹性
+  min_overlap: 0.85
+  rebalance_freq: M            # 来自 DEFAULT（月度）
+  beta_target: 0.5
+  beta_window: 60
+  beta_scale_max: 1.5          # 来自 DEFAULT（提高），允许牛市加暴露
+
+backtest:
+  start: "2018-01-01"
+  end: "2026-08-20"
+  initial_cash: 1000000
+
+report:
+  title: "A股多因子概率决策系统 · 折中方案 (REAL信号层+DEFAULT组合层) 2018-2026"
