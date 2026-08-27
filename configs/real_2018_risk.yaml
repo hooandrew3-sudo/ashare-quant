@@ -1,0 +1,71 @@
+# 风控增强版 A/B 实验（在 real_2018 基础上叠加）。
+# 结论（已实测，长窗口 OOS 2019-2026）：
+#   - 小盘辅助择时 = 负结果：与 CSI800 状态机双重降险，~47% 时间半仓，年化 24.6%→3.5%，
+#     回撤反而 -9.85%→-11.06%。已禁用。
+#   - 尾部熔断 = 负/边际：2020-02-03 疫情底触发卖出、错过 V 型反弹。已禁用。
+#   - 自适应滑点 = 中性偏正：更真实的冲击成本，保留作为可选项。
+data:
+  source: parquet
+  root: data
+  benchmark: "000906.SH"
+  sync:
+    universe: csi800_delisted
+    start: "2018-01-01"
+    end: ""
+    incremental: true
+
+factors:
+  composite_weight: t
+  composite_require_decay: false
+
+model:
+  name: auto
+  n_splits: 15
+  horizons: [5, 10, 20, 40]
+  n_seeds: 3
+  label_mode: binary
+  params:
+    n_estimators: 250
+    learning_rate: 0.05
+    num_leaves: 31
+    min_child_samples: 30
+    subsample: 0.8
+    colsample_bytree: 0.8
+
+portfolio:
+  top_n: 30
+  target_vol: 0.10
+  stickiness: 0.90
+  band: 0.15
+  exposure_step: 0.25
+  turnover_cap: 0.30
+  min_overlap: 0.85
+  rebalance_freq: Q
+  beta_target: 0.5
+  beta_window: 60
+  beta_scale_max: 1.0
+  smallcap_regime_enabled: false
+  smallcap_index: "000852.SH"
+  smallcap_long: 250
+  smallcap_floor: 0.5
+
+backtest:
+  start: "2018-01-01"
+  end: "2026-12-31"
+  initial_cash: 1000000
+  slippage_model: adaptive
+  slippage_cap_bp: 20.0
+  slippage_impact_coef: 5.0
+  circuit_breaker_enabled: false
+  circuit_breaker_daily_dd: 0.03
+  circuit_breaker_scale: 0.5
+
+stress:
+  scenarios:
+    bear_2018: ["2018-01-01", "2018-12-31"]
+    bear_2022: ["2022-01-01", "2022-12-31"]
+    smallcap_2024: ["2024-01-01", "2024-02-29"]
+    rally_2024: ["2024-09-24", "2025-02-28"]
+
+report:
+  title: "A股多因子概率决策系统 · 风控增强版回测（2018起）"
