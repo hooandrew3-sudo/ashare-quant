@@ -1,0 +1,72 @@
+# 真实数据（CSI800）回测配置
+data:
+  source: parquet            # 先同步（--source baostock --universe csi800 --step sync）再回测
+  root: data
+  benchmark: "000906.SH"
+  sync:
+    universe: csi800
+    start: "2021-01-01"
+    end: ""
+    incremental: true
+
+factors:
+  composite_weight: t          # 同类对照结论：t 加权 + 无衰减约束优于 icir+衰减约束
+  composite_require_decay: false
+
+model:
+  name: auto
+  n_splits: 5
+  horizons: [5, 10, 20, 40]
+  n_seeds: 3
+  label_mode: binary              # binary | quantile_contrast | regression（对比标签试验为负结果）
+  # 门禁口径已修正（v8）：composite_t 现为 OOS 区间 + Newey-West 校正的诚实值。
+  # v9 重校准：全部近期运行 OOS t ∈ [0.63, 1.00]，旧阈值 5.0 在新口径下不可达；
+  # 阈值调整为 1.5（NW-OOS 尺度的晋级目标），维持告警模式——
+  # 达标前任何放量决策不得引用回测绝对收益。
+  gate_enabled: true
+  gate_min_composite_t: 1.5
+  gate_block_on_fail: false
+  params:
+    n_estimators: 250
+    learning_rate: 0.05
+    num_leaves: 31
+    min_child_samples: 30
+    subsample: 0.8
+    colsample_bytree: 0.8
+
+portfolio:
+  top_n: 30
+  target_vol: 0.10
+  stickiness: 0.90
+  band: 0.15
+  # ---- v9 策略层优化（2026-08-25 实验矩阵，见 AUDIT_REPORT_v8 §9）----
+  # 病因诊断：季度调仓下 exposure_step=0.25 使状态机从低仓升至满仓需一年，
+  # 2024-2025 牛市平均仓位仅 0.29~0.34，是收益不达标的首要约束（选股本身
+  # 有效：调出仓均卖在 +22%）。采样频率（M）与步长是主导变量；档位校准在
+  # 季度采样下无意义（E3 与基线逐项一致），月度下才生效。
+  rebalance_freq: M        # Q→M：状态机月度采样（E1 单变量即 +10pp 年化）
+  exposure_step: 0.5       # 0.25→0.5：两期完成仓位迁移
+  regime:
+    levels: [1.0, 0.7, 0.4]  # 中间档 0.5→0.7：牛市减少无谓降档
+  stop_loss: 0.18          # 0.12→0.18：原止损在高波动牛市反复斩杀盈利单
+                           # （64 次止损→25 次，年化 +16pp）；冷却维持默认 63 日
+  turnover_cap: 0.30
+  min_overlap: 0.85
+  beta_target: 0.5
+  beta_window: 60
+  beta_scale_max: 1.0   # 试验结论：放大 beta 拖累 IR/回撤（E5 劣于 E4），维持禁用
+  # 稳健性对照（含 2022 熊市+2023 震荡全窗口，n_splits=8）：
+  #   新参数 5.46%/-9.45%/IR+0.108 vs 旧参数 4.58%/-9.30%/IR+0.044 —— 方向稳健；
+  #   牛市子窗（2024-02~2026-07）的 20.6% 为 regime 特有，禁止外推。
+
+backtest:
+  start: "2024-02-01"
+  end: "2026-07-31"
+  initial_cash: 1000000
+  # 基准股息率修正：000906.SH 为价格指数不含分红，组合隐含享受红利再投，
+  # 不修正则超额/IR 年化虚高约 2~2.5pp（审计 v8 遗留项3）。按中证800 近年
+  # 股息率估算 2%，引擎按日计提进基准曲线（近全收益口径）
+  benchmark_dividend_yield: 0.02
+
+report:
+  title: "A股多因子概率决策系统 · 真实数据回测报告（CSI800）"
